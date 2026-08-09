@@ -118,6 +118,88 @@ def event_risk(sym):
         return min(pen,15),sorted(set(hits)),pd.DataFrame([{"Subject":t} for t in texts[:10]])
     except Exception:return 0,[],pd.DataFrame()
 
+
+@st.cache_data(ttl=900,show_spinner=False)
+def batch_scan_universe(symbols, chunk_size=50):
+    """Fast first-pass scan. Uses batched Yahoo downloads to avoid hundreds of sequential requests."""
+    rows=[]
+    symbols=list(dict.fromkeys(symbols))
+    for start in range(0,len(symbols),chunk_size):
+        chunk=symbols[start:start+chunk_size]
+        try:
+            raw=yf.download(chunk,period="1y",auto_adjust=False,progress=False,group_by="column",threads=True)
+            if raw.empty: continue
+            for sym in chunk:
+                try:
+                    if isinstance(raw.columns,pd.MultiIndex):
+                        # yfinance usually returns field x ticker for multi-ticker downloads
+                        if sym not in raw.columns.get_level_values(-1): continue
+                        d=raw.xs(sym,axis=1,level=-1).dropna()
+                    else:
+                        d=raw.copy()
+                    d=d[["Open","High","Low","Close","Volume"]].dropna()
+                    if len(d)<210: continue
+                    x=ind(d).iloc[-1]
+                    rows.append({"Symbol":symbol_clean(sym),"_symbol":sym,"Close":float(x.Close),"SMA50":float(x.SMA50),"SMA200":float(x.SMA200),
+                                 "RSI":float(x.RSI),"VOL_RATIO":float(x.VOL_RATIO),"ATR%":float(x["ATR%"]),"BREAKOUT20":float(x.BREAKOUT20),"RET63":float(x.RET63)})
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=900,show_spinner=False)
+def auto_top10(limit=10):
+    """Rank the NSE universe with a fast batch pass, then apply full V5 scoring to a small shortlist.
+    The batch pass avoids hundreds of sequential price requests; fundamentals/events are only fetched
+    for the strongest candidates so this remains practical on Streamlit Community Cloud and phones.
+    """
+    syms=universe(); base=batch_scan_universe(syms)
+    if base.empty: return pd.DataFrame()
+    bench=benchmark().iloc[-1]
+    base["RS_NIFTY"]=base["RET63"]-float(bench.RET63)
+    base["Sector"]=[sector(x) for x in base["Symbol"]]
+    sector_median=base.groupby("Sector")["RET63"].transform("median")
+    base["Sector_RS"]=base["RET63"]-sector_median
+    # First-pass ranking: the same technical building blocks used by the V5 model.
+    base["T0"]=((base.Close>base.SMA50)&(base.SMA50>base.SMA200)).astype(int)*20
+    base["T0"]+=(base.Close>base.BREAKOUT20).astype(int)*15
+    base["T0"]+=(base.VOL_RATIO>=1.5).astype(int)*10
+    base["T0"]+=np.where(base.RSI.between(55,75),10,np.where(base.RSI.between(50,55),5,0))
+    base["T0"]+=(base.RS_NIFTY>0).astype(int)*10
+    base["T0"]+=(base.Sector_RS>0).astype(int)*10
+    base["T0"]+=np.where(base["ATR%"]<5,10,5)
+    base=base.sort_values("T0",ascending=False).head(max(20,limit*2)).copy()
+
+    rg,_=regime(); enriched=[]
+    for _,row in base.iterrows():
+        sym=row["_symbol"]
+        try:
+            f=fundamentals(sym); fs=fscore(f)
+            # Event checks are deliberately limited to the short list.
+            penalty,hits,_=event_risk(sym)
+            technical=float(row["T0"])
+            market=10 if rg=="BULLISH" else 5 if rg=="NEUTRAL" else 0
+            score=max(0,min(100,technical*.65+fs*.25+market-penalty))
+            reasons=[]
+            if row.Close>row.SMA50>row.SMA200: reasons.append("uptrend")
+            if row.Close>row.BREAKOUT20: reasons.append("20D breakout")
+            if row.VOL_RATIO>=1.5: reasons.append("volume expansion")
+            if row.RS_NIFTY>0: reasons.append("beats NIFTY")
+            if row.Sector_RS>0: reasons.append("beats sector")
+            if hits: reasons.append("event-risk flag")
+            entry=float(row.Close); stop=entry-2*float(row["ATR%"])/100*entry; target=entry+2*(entry-stop)
+            enriched.append({"Symbol":row["Symbol"],"Sector":row["Sector"],"Score":round(score,1),"Technical":round(technical,1),"Fundamental":fs,
+                "RS vs NIFTY %":round(row.RS_NIFTY*100,2),"Sector RS %":round(row.Sector_RS*100,2),"RSI":round(row.RSI,1),
+                "Vol X":round(row.VOL_RATIO,2),"ATR %":round(row["ATR%"],2),"Entry":round(entry,2),"Stop":round(stop,2),"Target":round(target,2),
+                "Event penalty":penalty,"Signal":"BUY CANDIDATE" if score>=75 and rg!="BEARISH" else "WATCH","Why":", ".join(reasons)})
+        except Exception:
+            continue
+    if not enriched: return pd.DataFrame()
+    out=pd.DataFrame(enriched).sort_values("Score",ascending=False).head(limit).reset_index(drop=True)
+    out.insert(0,"Rank",np.arange(1,len(out)+1))
+    return out
+
 def signal(sym):
     d=ind(prices(sym));x=d.iloc[-1];m=benchmark().iloc[-1];rg,_=regime();f=fundamentals(sym);fs=fscore(f);sr,sec=sector_rs(sym)
     rs=x.RET63-m.RET63
@@ -181,19 +263,48 @@ if tab=="🏠 Dashboard":
     rg,ico=regime();x=benchmark().iloc[-1]
     a,b,c=st.columns(3);a.metric("NIFTY 50",f"{x.Close:,.0f}");b.metric("Regime",f"{ico} {rg}");c.metric("Data",str(benchmark().index[-1].date()))
     st.info("V5 uses free provider data by default. It is designed for research/paper trading, not guaranteed real-time execution.")
+    st.subheader("🏆 V5 Top 10 today")
+    st.caption("One-tap shortlist: scans the available NSE universe, ranks candidates, then enriches the strongest setups with the full V5 score. These are candidates, not guaranteed buys.")
+    if st.button("🚀 Scan NSE → Top 10",key="dashboard_top10"):
+        with st.spinner("Scanning NSE universe and calculating V5 scores…"):
+            top=auto_top10(10)
+        if top.empty:
+            st.error("No candidates were returned. Refresh data and try again later; free market-data providers can rate-limit large scans.")
+        else:
+            cols=["Rank","Symbol","Score","Technical","Fundamental","RS vs NIFTY %","Sector RS %","RSI","Vol X","Entry","Stop","Target","Event penalty","Signal","Why"]
+            st.dataframe(top[cols],use_container_width=True,hide_index=True)
+            st.download_button("⬇️ Export Top 10",top.to_csv(index=False),"v5_top10.csv","text/csv",key="top10_export")
+            st.session_state["top10"]=top
+    elif "top10" in st.session_state and not st.session_state.top10.empty:
+        top=st.session_state.top10
+        st.dataframe(top[["Rank","Symbol","Score","RSI","Vol X","Entry","Stop","Target","Signal","Why"]],use_container_width=True,hide_index=True)
 
 elif tab=="🔎 Scanner":
     u=universe();st.caption(f"Universe available: {len(u)} symbols. The app attempts to refresh the official Nifty 500 constituent CSV; otherwise it uses the bundled fallback.")
-    sel=st.multiselect("Scan universe",u,default=u[:12])
-    if st.button("🚀 Run scanner"):
-        rows=[]
-        with st.spinner("Scanning selected symbols…"):
-            for s in sel:
-                try:rows.append(signal(s))
-                except Exception as e:st.warning(f"{s}: {e}")
-        if rows:
-            out=pd.DataFrame(rows).sort_values(["Signal","Score"],ascending=[True,False]);st.dataframe(out,use_container_width=True,hide_index=True)
-            st.download_button("⬇️ Export signals",out.to_csv(index=False),"v5_signals.csv","text/csv")
+    mode=st.radio("Scan mode",["🏆 Automatic Top 10","🎯 Custom selection"],horizontal=True)
+    if mode=="🏆 Automatic Top 10":
+        st.caption("Recommended for daily use. The app performs a fast batch scan first, then applies the full V5 scoring model to the strongest candidates.")
+        if st.button("🚀 Run NSE Top 10",key="scanner_top10"):
+            with st.spinner("Scanning NSE universe…"):
+                out=auto_top10(10)
+            if out.empty: st.error("No candidates returned. Try Refresh all cached data and run again later.")
+            else:
+                st.session_state["top10"]=out
+                cols=["Rank","Symbol","Score","Technical","Fundamental","RS vs NIFTY %","Sector RS %","RSI","Vol X","Entry","Stop","Target","Event penalty","Signal","Why"]
+                st.dataframe(out[cols],use_container_width=True,hide_index=True)
+                st.download_button("⬇️ Export Top 10",out.to_csv(index=False),"v5_top10.csv","text/csv",key="scanner_top10_export")
+    else:
+        sel=st.multiselect("Scan universe",u,default=u[:12])
+        if st.button("🚀 Run custom scanner",key="custom_scan"):
+            rows=[]
+            with st.spinner("Scanning selected symbols…"):
+                for s in sel:
+                    try: rows.append(signal(s))
+                    except Exception as e: st.warning(f"{s}: {e}")
+            if rows:
+                out=pd.DataFrame(rows).sort_values("Score",ascending=False)
+                st.dataframe(out,use_container_width=True,hide_index=True)
+                st.download_button("⬇️ Export signals",out.to_csv(index=False),"v5_signals.csv","text/csv",key="custom_export")
 
 elif tab=="🔍 Stock":
     sym=st.selectbox("NSE stock",universe());d=ind(prices(sym));x=d.iloc[-1];r=signal(sym);f=fundamentals(sym);pen,hits,ann=event_risk(sym)
