@@ -247,6 +247,14 @@ ZYDUSLIFE
 """.splitlines()
 BUNDLED_SYMBOLS = sorted(set(s.strip().upper() + ".NS" for s in BUNDLED_SYMBOLS if s.strip()))
 
+# Helpers needed by the filtered-watchlist declaration below.
+def symbol_clean(s):
+    return str(s).upper().replace(".NS", "").strip()
+
+def nse_symbol(s):
+    s = symbol_clean(s)
+    return s + ".NS"
+
 # User-provided filtered positional watchlist (32 NSE symbols from the uploaded screenshots).
 # This is an additional scan universe only; it does not alter the Nifty 200 universe or scoring formulas.
 FILTERED_STOCKS = [
@@ -270,13 +278,6 @@ SECTOR_MAP = {
     "LT":"Industrials","SIEMENS":"Industrials","ABB":"Industrials","HAL":"Industrials","BEL":"Industrials","CUMMINSIND":"Industrials","CGPOWER":"Industrials","BHEL":"Industrials","THERMAX":"Industrials","POLYCAB":"Industrials","KEI":"Industrials","KEC":"Industrials","RVNL":"Industrials","IRCON":"Industrials","NBCC":"Industrials","NCC":"Industrials","COCHINSHIP":"Industrials","MAZDOCK":"Industrials","GRSE":"Industrials","BEML":"Industrials","SUZLON":"Industrials","SOLARINDS":"Industrials","WAAREEENER":"Industrials",
     "ADANIENT":"Diversified","ADANIGREEN":"Utilities","ADANIPORTS":"Industrials","ADANIPOWER":"Utilities","ABCAPITAL":"Financials","ABFRL":"Consumer","APARINDS":"Industrials","AMBER":"Consumer Durables","DIXON":"Consumer Durables","ASIANPAINT":"Consumer Durables","BERGEPAINT":"Consumer Durables","BLUESTARCO":"Consumer Durables","VOLTAS":"Consumer Durables","HAVELLS":"Consumer Durables","WHIRLPOOL":"Consumer Durables","KALYANKJIL":"Consumer Durables","KAJARIACER":"Consumer Durables","CROMPTON":"Consumer Durables","VGUARD":"Consumer Durables",
 }
-
-def symbol_clean(s):
-    return str(s).upper().replace(".NS", "").strip()
-
-def nse_symbol(s):
-    s = symbol_clean(s)
-    return s + ".NS"
 
 def sector(sym):
     return SECTOR_MAP.get(symbol_clean(sym), "Other")

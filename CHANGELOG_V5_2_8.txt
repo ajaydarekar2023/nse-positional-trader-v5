@@ -1,0 +1,7 @@
+V5.2.8 — startup fix for filtered-watchlist feature
+
+Fix:
+- Moved symbol_clean()/nse_symbol() helper definitions above FILTERED_STOCKS initialization.
+- Prevents NameError during Streamlit application startup introduced by the filtered-32-stock feature.
+
+No scoring, eligibility, Nifty 200 universe, formulas, risk/target/stop-loss logic, journal logic, or brokerage-report logic was changed.
