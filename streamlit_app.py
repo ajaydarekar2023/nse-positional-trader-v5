@@ -22,10 +22,22 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.0"
+APP_VERSION = "V5.2.2"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+
+# V5.2.2 eligibility controls. These are deliberately conservative for positional trading.
+MAX_STOCK_PRICE = 15000.0          # Exclude stocks whose latest close is above this level.
+MIN_AVG_TRADED_VALUE_CR = 5.0      # 20-day average traded value must be >= ₹5 crore/day.
+MIN_MEDIAN_TRADED_VALUE_CR = 2.0   # 20-day median traded value must be >= ₹2 crore/day.
+MIN_ACTIVE_VOLUME_DAYS_PCT = 90.0   # At least 90% of the last 20 sessions must have positive volume.
+SWING_LOOKBACK = 20
+ATR_STOP_MULTIPLIER = 2.0
+SWING_BUFFER_ATR = 0.25
+MAX_STOP_DISTANCE_PCT = 12.0        # Avoid structurally excessive stops.
+MIN_STOP_DISTANCE_PCT = 1.0         # Avoid meaningless/tight stops.
+DEFAULT_R_MULTIPLE = 2.0
 
 # Bundled current-ish snapshot used only when the official online constituent download is unavailable.
 # It is a fallback snapshot, not a claim of live NSE membership.
@@ -646,10 +658,15 @@ def daily_features(d):
     d["ATR%"] = 100*d.ATR/d.Close
     d["VOL20"] = d.Volume.rolling(20).mean()
     d["VOL_RATIO"] = d.Volume/d.VOL20
+    d["TRADED_VALUE"] = d.Close * d.Volume
+    d["AVG_TRADED_VALUE20"] = d.TRADED_VALUE.rolling(20).mean()
+    d["MEDIAN_TRADED_VALUE20"] = d.TRADED_VALUE.rolling(20).median()
+    d["ACTIVE_VOLUME_DAYS20"] = d.Volume.gt(0).rolling(20).mean() * 100
     d["BREAKOUT20"] = d.High.rolling(20).max().shift(1)
+    d["SWING_LOW20"] = d.Low.rolling(SWING_LOOKBACK).min().shift(1)
     d["RET21"] = d.Close.pct_change(21)
     d["RET63"] = d.Close.pct_change(63)
-    return d.dropna(subset=["SMA20","SMA50","SMA200","RSI","ATR","ATR%","VOL20","VOL_RATIO","BREAKOUT20","RET21","RET63"])
+    return d.dropna(subset=["SMA20","SMA50","SMA200","RSI","ATR","ATR%","VOL20","VOL_RATIO","BREAKOUT20","SWING_LOW20","RET21","RET63","AVG_TRADED_VALUE20","MEDIAN_TRADED_VALUE20","ACTIVE_VOLUME_DAYS20"])
 
 def weekly_features(d):
     w = d.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
@@ -665,7 +682,10 @@ def feature_row(sym, x, wx, history_len):
         "Symbol": symbol_clean(sym), "_symbol": sym, "Sector": sector(sym),
         "Close": float(x.Close), "SMA20": float(x.SMA20), "SMA50": float(x.SMA50), "SMA200": float(x.SMA200),
         "RSI": float(x.RSI), "ATR": float(x.ATR), "ATR%": float(x["ATR%"]), "VOL_RATIO": float(x.VOL_RATIO),
-        "BREAKOUT20": float(x.BREAKOUT20), "RET21": float(x.RET21), "RET63": float(x.RET63),
+        "BREAKOUT20": float(x.BREAKOUT20), "SwingLow20": float(x.SWING_LOW20), "RET21": float(x.RET21), "RET63": float(x.RET63),
+        "AvgTradedValue20Cr": float(x.AVG_TRADED_VALUE20)/1e7,
+        "MedianTradedValue20Cr": float(x.MEDIAN_TRADED_VALUE20)/1e7,
+        "ActiveVolumeDays20Pct": float(x.ACTIVE_VOLUME_DAYS20),
         "WeeklyClose": float(wx.Close) if wx is not None else np.nan,
         "WeeklySMA20": float(wx.SMA20W) if wx is not None else np.nan,
         "WeeklySMA40": float(wx.SMA40W) if wx is not None else np.nan,
@@ -692,6 +712,99 @@ def market_regime():
     except Exception:
         return "UNKNOWN", "⚪", None
 
+def liquidity_status(r):
+    """Return (eligible, reason) for positional-trading liquidity/price controls."""
+    price = float(r.Close)
+    avg_cr = float(r.get("AvgTradedValue20Cr", np.nan))
+    med_cr = float(r.get("MedianTradedValue20Cr", np.nan))
+    active_pct = float(r.get("ActiveVolumeDays20Pct", np.nan))
+    reasons = []
+    if not np.isfinite(price) or price > MAX_STOCK_PRICE:
+        reasons.append(f"price > ₹{MAX_STOCK_PRICE:,.0f}")
+    if not np.isfinite(avg_cr) or avg_cr < MIN_AVG_TRADED_VALUE_CR:
+        reasons.append(f"20D avg traded value < ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr")
+    if not np.isfinite(med_cr) or med_cr < MIN_MEDIAN_TRADED_VALUE_CR:
+        reasons.append(f"20D median traded value < ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr")
+    if not np.isfinite(active_pct) or active_pct < MIN_ACTIVE_VOLUME_DAYS_PCT:
+        reasons.append(f"active-volume days < {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%")
+    return len(reasons) == 0, "; ".join(reasons)
+
+def derive_stop_target(d, entry=None, r_multiple=DEFAULT_R_MULTIPLE):
+    """Derive a structurally sensible long stop and target.
+
+    Compares a 2x ATR stop with a recent swing-low stop, rejects absurdly
+    tight/wide distances, and uses the tighter valid structural stop.
+    The position-size calculator remains the final risk constraint.
+    """
+    if d is None or d.empty:
+        raise ValueError("Price history is empty")
+    f = d if "ATR" in d.columns else daily_features(d)
+    x = f.iloc[-1]
+    entry = float(x.Close if entry is None else entry)
+    atr = float(x.ATR)
+    if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
+        raise ValueError("Invalid entry/ATR for stop calculation")
+    atr_stop = entry - ATR_STOP_MULTIPLIER * atr
+    recent = f.tail(SWING_LOOKBACK)
+    swing_low = float(recent.Low.min())
+    swing_stop = swing_low - SWING_BUFFER_ATR * atr
+    candidates = [("ATR 2x", atr_stop), ("Swing low", swing_stop)]
+    valid = []
+    for method, stop in candidates:
+        dist_pct = (entry - stop) / entry * 100
+        if MIN_STOP_DISTANCE_PCT <= dist_pct <= MAX_STOP_DISTANCE_PCT and stop < entry:
+            valid.append((method, stop, dist_pct))
+    if valid:
+        # Prefer the tighter valid stop to avoid unnecessary risk, but keep it
+        # below a real technical structure when possible.
+        method, stop, dist_pct = min(valid, key=lambda z: z[2])
+    else:
+        # Fall back to ATR stop if structurally reasonable; otherwise cap the
+        # distance so a bad swing low cannot create an outsized position risk.
+        method, stop = "ATR 2x fallback", atr_stop
+        dist_pct = (entry - stop) / entry * 100
+        if dist_pct > MAX_STOP_DISTANCE_PCT:
+            stop = entry * (1 - MAX_STOP_DISTANCE_PCT / 100)
+            method = "Capped ATR fallback"
+        elif dist_pct < MIN_STOP_DISTANCE_PCT:
+            stop = entry * (1 - MIN_STOP_DISTANCE_PCT / 100)
+            method = "Minimum-distance fallback"
+        dist_pct = (entry - stop) / entry * 100
+    risk_per_share = entry - stop
+    target = entry + r_multiple * risk_per_share
+    return {
+        "Stop": round(float(stop), 2),
+        "Target": round(float(target), 2),
+        "RiskPerShare": round(float(risk_per_share), 2),
+        "StopDistancePct": round(float(dist_pct), 2),
+        "StopMethod": method,
+        "RMultiple": float(r_multiple),
+        "ATR": round(atr, 2),
+        "SwingLow20": round(swing_low, 2),
+    }
+
+def derive_stop_from_values(entry, atr, swing_low, r_multiple=DEFAULT_R_MULTIPLE):
+    """Fast stop/target helper for already-computed scan rows."""
+    entry=float(entry); atr=float(atr); swing_low=float(swing_low)
+    atr_stop=entry-ATR_STOP_MULTIPLIER*atr
+    swing_stop=swing_low-SWING_BUFFER_ATR*atr
+    valid=[]
+    for method,stop in (("ATR 2x",atr_stop),("Swing low",swing_stop)):
+        dist=(entry-stop)/entry*100
+        if MIN_STOP_DISTANCE_PCT <= dist <= MAX_STOP_DISTANCE_PCT and stop < entry:
+            valid.append((method,stop,dist))
+    if valid:
+        method,stop,dist=min(valid,key=lambda z:z[2])
+    else:
+        method,stop,dist="ATR 2x fallback",atr_stop,(entry-atr_stop)/entry*100
+        if dist>MAX_STOP_DISTANCE_PCT:
+            stop=entry*(1-MAX_STOP_DISTANCE_PCT/100); method="Capped ATR fallback"
+        elif dist<MIN_STOP_DISTANCE_PCT:
+            stop=entry*(1-MIN_STOP_DISTANCE_PCT/100); method="Minimum-distance fallback"
+        dist=(entry-stop)/entry*100
+    risk=entry-stop
+    return {"Stop":round(stop,2),"Target":round(entry+r_multiple*risk,2),"RiskPerShare":round(risk,2),"StopDistancePct":round(dist,2),"StopMethod":method,"RMultiple":float(r_multiple),"ATR":round(atr,2),"SwingLow20":round(swing_low,2)}
+
 def score_trend(r):
     pts = 0
     pts += 8 if r.Close > r.SMA50 else 0
@@ -712,12 +825,23 @@ def score_momentum(r):
     pts += 5 if r.RET63 > 0.08 else 3 if r.RET63 > 0 else 0
     return min(15, pts)
 
-def score_relative(r, benchmark_return):
-    rs = r.RET63 - benchmark_return
-    sector_rs = r.RET63 - r.get("SectorMedianRET63", r.RET63)
-    return (10 if rs > 0.08 else 7 if rs > 0 else 3 if rs > -0.05 else 0,
-            10 if sector_rs > 0.08 else 7 if sector_rs > 0 else 3 if sector_rs > -0.05 else 0,
-            rs, sector_rs)
+def score_relative(r, benchmark_return, sector_median_return=None):
+    """Score relative strength against NIFTY and the stock's sector.
+
+    Sector relative strength is calculated from the median 63-day return of
+    eligible stocks in the same mapped sector. If fewer than two sector peers
+    are available, the sector component is explicitly marked unavailable and
+    receives a neutral 5/10 rather than comparing the stock with itself.
+    """
+    rs = float(r.RET63) - float(benchmark_return)
+    if sector_median_return is None or not np.isfinite(sector_median_return):
+        sector_rs = np.nan
+        sector_points = 5
+    else:
+        sector_rs = float(r.RET63) - float(sector_median_return)
+        sector_points = 10 if sector_rs > 0.08 else 7 if sector_rs > 0 else 3 if sector_rs > -0.05 else 0
+    nifty_points = 10 if rs > 0.08 else 7 if rs > 0 else 3 if rs > -0.05 else 0
+    return nifty_points, sector_points, rs, sector_rs
 
 def score_volume(r):
     breakout = r.Close > r.BREAKOUT20
@@ -738,6 +862,33 @@ def fundamentals(symbol):
         "Revenue growth": info.get("revenueGrowth"), "Earnings growth": info.get("earningsGrowth"),
         "Profit margin": info.get("profitMargins"), "Market cap": info.get("marketCap"),
     }
+
+def safe_fundamental_rows(f):
+    """Convert yfinance fundamental values into a guaranteed 2-D display table.
+    Some providers can return numpy/list-like values for an otherwise scalar field;
+    Streamlit/pandas may reject those as non-2-D input.
+    """
+    rows = []
+    for key, value in (f or {}).items():
+        try:
+            if isinstance(value, np.ndarray):
+                if value.size == 1:
+                    value = value.reshape(-1)[0].item()
+                else:
+                    value = ", ".join(map(str, value.reshape(-1).tolist()))
+            elif isinstance(value, (list, tuple, set)):
+                if len(value) == 1:
+                    value = next(iter(value))
+                else:
+                    value = ", ".join(map(str, value))
+            elif isinstance(value, dict):
+                value = json.dumps(value, default=str)
+        except Exception:
+            value = str(value)
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            value = "N/A"
+        rows.append({"Metric": str(key), "Value": value})
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
 
 def fundamental_score(f):
     # 0-15. Missing data is neutral, not a rejection. Status is shown separately.
@@ -801,69 +952,77 @@ def daily_status(r):
     return "BEARISH", "🔴"
 
 def build_ranked_candidates(base, limit=20, enrich_n=40):
-    if base.empty: return pd.DataFrame(), {}, {}
+    if base.empty:
+        return pd.DataFrame(), {}, {}
     regime, _, bench = market_regime()
     bench_ret = float(bench.RET63) if bench is not None else 0.0
     base = base.copy()
     base["Sector"] = base["_symbol"].map(sector)
-    med = base.groupby("Sector")["RET63"].transform("median")
-    base["SectorMedianRET63"] = med
+    # Robust sector benchmark: median 63D return of peers, excluding the stock itself
+    # when the sector has multiple members.
+    sector_counts = base.groupby("Sector")["_symbol"].transform("count")
+    sector_sum = base.groupby("Sector")["RET63"].transform("sum")
+    base["SectorMedianRET63"] = base.groupby("Sector")["RET63"].transform("median")
+    base["SectorPeerCount"] = sector_counts
+    eligible = []
+    excluded = []
+    for _, r in base.iterrows():
+        ok, reason = liquidity_status(r)
+        if ok:
+            eligible.append(r)
+        else:
+            excluded.append((r["_symbol"], reason))
+    if not eligible:
+        return pd.DataFrame(), {"Universe": len(base), "Price data available": len(base), "Rankable candidates": 0, "Top 20 returned": 0, "Excluded by price/liquidity": len(excluded)}, {}
+    base = pd.DataFrame(eligible).reset_index(drop=True)
+    # Recalculate sector medians after price/liquidity eligibility.
+    base["SectorMedianRET63"] = base.groupby("Sector")["RET63"].transform("median")
+    base["SectorPeerCount"] = base.groupby("Sector")["RET63"].transform("count")
     rows=[]
-    tech_pass = 0
     for _, r in base.iterrows():
         trend = score_trend(r)
         mom = score_momentum(r)
-        rs_n, rs_s, rsn_raw, rss_raw = score_relative(r, bench_ret)
+        sector_median = float(r["SectorMedianRET63"]) if r["SectorPeerCount"] >= 2 else None
+        rs_n, rs_s, rsn_raw, rss_raw = score_relative(r, bench_ret, sector_median)
         vol, breakout = score_volume(r)
-        # Broad eligibility: price history is critical; technical weakness affects score, not eligibility.
-        if r.HistoryDays >= 210:
-            tech_pass += 1
         entry = entry_quality(r)
-        ws, wi = weekly_status(r)
-        ds, di = daily_status(r)
+        ws, wi = weekly_status(r); ds, di = daily_status(r)
         rows.append({
             "Symbol": r["Symbol"], "_symbol": r["_symbol"], "Sector": r["Sector"], "Trend": trend, "Momentum": mom,
-            "RS vs NIFTY": rs_n, "Sector RS": rs_s, "Volume/Breakout": vol, "RSNIFTY%": rsn_raw*100, "SectorRS%": rss_raw*100,
+            "RS vs NIFTY": rs_n, "Sector RS": rs_s, "RSNIFTY%": rsn_raw*100,
+            "SectorRS%": (rss_raw*100 if np.isfinite(rss_raw) else np.nan),
+            "SectorPeerCount": int(r["SectorPeerCount"]), "Volume/Breakout": vol,
             "Close": r.Close, "SMA50": r.SMA50, "SMA200": r.SMA200, "RSI": r.RSI, "Vol X": r.VOL_RATIO, "ATR": r.ATR, "ATR%": r["ATR%"],
             "BREAKOUT20": r.BREAKOUT20, "RET21": r.RET21, "RET63": r.RET63, "Weekly": ws, "WeeklyIcon": wi, "Daily": ds,
             "Entry Quality": entry, "Breakout": breakout, "HistoryDays": r.HistoryDays,
+            "AvgTradedValue20Cr": r.AvgTradedValue20Cr, "MedianTradedValue20Cr": r.MedianTradedValue20Cr,
+            "ActiveVolumeDays20Pct": r.ActiveVolumeDays20Pct,
         })
     scored = pd.DataFrame(rows)
     scored["TechnicalCore"] = scored["Trend"] + scored["Momentum"] + scored["RS vs NIFTY"] + scored["Sector RS"] + scored["Volume/Breakout"]
-    # Market regime influences the score, but does not erase the candidate pool.
     scored["RegimeAdj"] = 5 if regime == "BULL" else 2.5 if regime == "NEUTRAL" else 0
-    scored["Fundamental"] = 7.5
-    scored["FundStatus"] = "NOT ENRICHED"
-    scored["EventPenalty"] = 0
-    scored["EventStatus"] = "NOT ENRICHED"
-    scored["DataQuality"] = 100.0
+    scored["Fundamental"] = 7.5; scored["FundStatus"] = "NOT ENRICHED"
+    scored["EventPenalty"] = 0; scored["EventStatus"] = "NOT ENRICHED"; scored["DataQuality"] = 100.0
     scored = scored.sort_values(["TechnicalCore","Entry Quality"], ascending=False).reset_index(drop=True)
-
-    # Enrich a broader shortlist. Missing fundamentals/news never remove a stock.
     enriched = min(enrich_n, len(scored))
     for idx in range(enriched):
         sym = scored.at[idx, "_symbol"]
-        f = fundamentals(sym)
-        fs, fstatus = fundamental_score(f)
-        scored.at[idx, "Fundamental"] = fs
-        scored.at[idx, "FundStatus"] = fstatus
+        f = fundamentals(sym); fs, fstatus = fundamental_score(f)
+        scored.at[idx, "Fundamental"] = fs; scored.at[idx, "FundStatus"] = fstatus
         scored.at[idx, "DataQuality"] = 100.0 if fstatus == "FULL" else 90.0 if fstatus == "PARTIAL" else 80.0
         if idx < min(25, enriched):
             pen, hits, _, estate = event_risk(sym)
-            scored.at[idx, "EventPenalty"] = pen
-            scored.at[idx, "EventStatus"] = estate
-            if hits:
-                scored.at[idx, "EventHits"] = ", ".join(hits)
-            else:
-                scored.at[idx, "EventHits"] = ""
+            scored.at[idx, "EventPenalty"] = pen; scored.at[idx, "EventStatus"] = estate
+            scored.at[idx, "EventHits"] = ", ".join(hits) if hits else ""
         else:
             scored.at[idx, "EventHits"] = ""
-
-    # Normalize 0-100 score: components are exact 25/15/20/15/15 + risk/event 10 via penalty.
+    # Exact component maximum: Trend 25 + Momentum 15 + RS 20 + Volume 15 + Fundamentals 15 = 90.
+    # Regime is a separate 0-5 modifier and event risk is a 0-10 penalty.
+    # Normalize against the maximum achievable score in the current regime.
+    max_regime = 5.0 if regime == "BULL" else 2.5 if regime == "NEUTRAL" else 0.0
+    max_score = 90.0 + max_regime
     scored["RawScore"] = scored["Trend"] + scored["Momentum"] + scored["RS vs NIFTY"] + scored["Sector RS"] + scored["Volume/Breakout"] + scored["Fundamental"] + scored["RegimeAdj"] - scored["EventPenalty"]
-    # Base components total 90 + regime adjustment up to 5. Normalize to a 100-point presentation.
-    scored["Score"] = (scored["RawScore"] / 95 * 100).clip(0,100)
-    # If the fundamental field was not enriched, the neutral 7.5 keeps ranking possible but the warning remains.
+    scored["Score"] = (scored["RawScore"] / max_score * 100).clip(0,100)
     scored["PriorityFit"] = np.select([
         (scored["Weekly"]=="BULLISH") & (scored["Daily"]=="BULLISH") & (regime=="BULL"),
         (scored["Daily"]=="BULLISH") & (scored["Weekly"]!="BEARISH"),
@@ -871,29 +1030,30 @@ def build_ranked_candidates(base, limit=20, enrich_n=40):
     ], [100,85,65], default=40)
     scored["PriorityScore"] = (0.60*scored["Score"] + 0.25*scored["Entry Quality"] + 0.15*scored["PriorityFit"]).round(1)
     scored = scored.sort_values(["Score","Entry Quality"], ascending=False).reset_index(drop=True)
-    top20 = scored.head(limit).copy()
-    top20.insert(0, "Rank", np.arange(1,len(top20)+1))
+    top20 = scored.head(limit).copy(); top20.insert(0, "Rank", np.arange(1,len(top20)+1))
+    stop_rows=[]
+    for _, row in top20.iterrows():
+        stp=derive_stop_from_values(float(row["Close"]), float(row["ATR"]), float(row["SwingLow20"]))
+        stop_rows.append(stp)
+    stop_df=pd.DataFrame(stop_rows, index=top20.index)
+    for col in stop_df.columns: top20[col]=stop_df[col]
     top20["Entry"] = top20["Close"].round(2)
-    top20["Stop"] = (top20["Entry"] - 2*top20["ATR"]).round(2)
-    top20["Target"] = (top20["Entry"] + 2*(top20["Entry"]-top20["Stop"])).round(2)
     top20["Signal"] = np.where((top20["Score"]>=75) & (regime!="BEAR"), "PRIORITY CANDIDATE", "WATCH")
     top20["Why"] = top20.apply(lambda x: "; ".join([
         "uptrend" if x["Daily"]=="BULLISH" else "daily trend not bullish",
         "weekly confirmation" if x["Weekly"]=="BULLISH" else f"weekly {x['Weekly'].lower()}",
         "relative strength" if x["RS vs NIFTY"]>=7 else "mixed relative strength",
+        "liquid" if x["AvgTradedValue20Cr"]>=MIN_AVG_TRADED_VALUE_CR else "liquidity caution",
         "volume expansion" if x["Vol X"]>=1.5 else "normal volume",
         "breakout" if x["Breakout"] else "near/under breakout",
     ]), axis=1)
     health = {
-        "Universe": len(universe()),
-        "Price data available": len(base),
-        "Technical candidates": tech_pass,
-        "Rankable candidates": len(scored),
-        "Enriched candidates": enriched,
-        "Event-enriched": min(25, enriched),
-        "Top 20 returned": len(top20),
-        "Data source": load_universe()[1],
-        "Data mode": load_universe()[2],
+        "Universe": len(universe()), "Price data available": len(base) + len(excluded),
+        "Price/liquidity eligible": len(base), "Excluded by price/liquidity": len(excluded),
+        "Technical candidates": len(base), "Rankable candidates": len(scored),
+        "Enriched candidates": enriched, "Event-enriched": min(25, enriched),
+        "Top 20 returned": len(top20), "Data source": load_universe()[1], "Data mode": load_universe()[2],
+        "Eligibility": f"Close ≤ ₹{MAX_STOCK_PRICE:,.0f}; 20D avg traded value ≥ ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr; median ≥ ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr; active volume days ≥ {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%",
     }
     return top20, health, scored
 
@@ -935,15 +1095,31 @@ def signal(symbol):
     if isinstance(d.columns,pd.MultiIndex): d=extract_symbol_frame(d,sym,1)
     d=d[["Open","High","Low","Close","Volume"]].dropna()
     f=daily_features(d); x=f.iloc[-1]
+    ok, reason = liquidity_status(feature_row(sym, x, weekly_features(d).iloc[-1] if not weekly_features(d).empty else None, len(d)))
+    if not ok:
+        raise ValueError(f"{symbol_clean(sym)} is excluded by V5.2.2 eligibility rules: {reason}")
     w=weekly_features(d); wx=w.iloc[-1] if not w.empty else None
     bench=benchmark_data().iloc[-1]
-    r=feature_row(sym,x,wx,len(d)); r["SectorMedianRET63"]=r["RET63"]
-    trend=score_trend(pd.Series(r)); mom=score_momentum(pd.Series(r)); rsn,rss,rsnr,rsstr=score_relative(pd.Series(r),float(bench.RET63)); vol,br=score_volume(pd.Series(r))
+    r=feature_row(sym,x,wx,len(d))
+    # Use the already-scanned universe when available for a robust sector benchmark.
+    sector_median=None; peer_count=0
+    try:
+        if "scan" in st.session_state:
+            ranked=st.session_state["scan"][3]
+            sec=sector(sym); peers=ranked[ranked["Sector"]==sec]
+            if len(peers)>=2:
+                sector_median=float(peers["RET63"].median()); peer_count=len(peers)
+    except Exception:
+        pass
+    if sector_median is None:
+        sector_median=float(r["RET63"]); peer_count=1
+    trend=score_trend(pd.Series(r)); mom=score_momentum(pd.Series(r)); rsn,rss,rsnr,rsstr=score_relative(pd.Series(r),float(bench.RET63), None if peer_count<2 else sector_median); vol,br=score_volume(pd.Series(r))
     fq,fstatus=fundamental_score(fundamentals(sym)); regime,_,_=market_regime(); pen,hits,ann,estate=event_risk(sym)
-    score=float(np.clip((trend+mom+rsn+rss+vol+fq+(5 if regime=="BULL" else 2.5 if regime=="NEUTRAL" else 0)-pen)/95*100,0,100))
-    entry=float(x.Close); stop=entry-2*float(x.ATR); target=entry+2*(entry-stop)
+    max_regime=5.0 if regime=="BULL" else 2.5 if regime=="NEUTRAL" else 0.0; max_score=90.0+max_regime
+    score=float(np.clip((trend+mom+rsn+rss+vol+fq+max_regime-pen)/max_score*100,0,100))
+    stp=derive_stop_target(d,entry=float(x.Close))
     ws,wi=weekly_status(pd.Series(r)); ds,di=daily_status(pd.Series(r))
-    return {"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2),"RSI":round(x.RSI,1),"Vol X":round(x.VOL_RATIO,2),"ATR %":round(x["ATR%"],2),"Weekly":ws,"Daily":ds,"Entry Quality":entry_quality(pd.Series(r)),"Entry":round(entry,2),"Stop":round(stop,2),"Target":round(target,2),"Event hits":hits}, d, f, ann
+    return {"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2) if np.isfinite(rsstr) else None,"Sector peer count":peer_count,"RSI":round(x.RSI,1),"Vol X":round(x.VOL_RATIO,2),"ATR %":round(x["ATR%"],2),"20D avg traded value ₹Cr":round(x.AVG_TRADED_VALUE20/1e7,2),"20D median traded value ₹Cr":round(x.MEDIAN_TRADED_VALUE20/1e7,2),"Active volume days %":round(x.ACTIVE_VOLUME_DAYS20,1),"Weekly":ws,"Daily":ds,"Entry Quality":entry_quality(pd.Series(r)),"Entry":round(float(x.Close),2),**stp,"Event hits":hits}, d, f, ann
 
 def risk_size(cap,riskpct,entry,stop,maxpos):
     rps=abs(entry-stop); budget=cap*riskpct/100; shares=int(budget/rps) if rps else 0
@@ -968,7 +1144,12 @@ def backtest(sym,initial,riskpct,maxpos,fee_bps,slip_bps):
                 gross=(exit_px-pos["entry"])*pos["shares"];turn=exit_px*pos["shares"]+pos["entry"]*pos["shares"];all_cost=costs(turn,fee_bps+slip_bps);cash+=exit_px*pos["shares"]-all_cost
                 trades.append([pos["date"],d.index[i],pos["entry"],exit_px,pos["shares"],gross-all_cost,reason]);pos=None
         if pos is None and r.Close>r.BREAKOUT20 and r.Close>r.SMA50>r.SMA200 and r.VOL_RATIO>=1.5:
-            en=float(d.iloc[i+1].Open);stop=en-2*float(r.ATR);target=en+2*(en-stop);sh=int((cash*riskpct/100)/(en-stop));sh=min(sh,int(cash*maxpos/100/en)) if en else 0
+            en=float(d.iloc[i+1].Open)
+            try:
+                stp=derive_stop_target(d.iloc[:i+1], entry=en); stop=stp["Stop"]; target=stp["Target"]
+            except Exception:
+                stop=en-2*float(r.ATR); target=en+DEFAULT_R_MULTIPLE*(en-stop)
+            sh=int((cash*riskpct/100)/(en-stop));sh=min(sh,int(cash*maxpos/100/en)) if en else 0
             if sh:
                 cost=en*sh;cash-=cost+costs(cost,fee_bps+slip_bps);pos={"date":d.index[i+1],"entry":en,"stop":stop,"target":target,"shares":sh}
         equity.append([d.index[i],cash+(pos["shares"]*r.Close if pos else 0)])
@@ -1090,6 +1271,7 @@ elif tab=="🔎 Scanner":
 
 elif tab=="🔍 Stock":
     sym=st.selectbox("NSE stock",universe())
+    st.caption(f"Eligibility: close ≤ ₹{MAX_STOCK_PRICE:,.0f} and liquid (20D avg traded value ≥ ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr, median ≥ ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr, active volume days ≥ {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%).")
     if st.button("Analyze stock",key="anstock"):
         with st.spinner("Loading stock data…"):
             try: st.session_state["stock_analysis"]=signal(sym)
@@ -1100,8 +1282,15 @@ elif tab=="🔍 Stock":
         fig=go.Figure(); fig.add_trace(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name="Price"));
         dd=daily_features(d); fig.add_trace(go.Scatter(x=dd.index,y=dd.SMA50,name="SMA50")); fig.add_trace(go.Scatter(x=dd.index,y=dd.SMA200,name="SMA200")); fig.update_layout(height=420,xaxis_rangeslider_visible=False,margin=dict(l=5,r=5,t=5,b=5)); st.plotly_chart(fig,use_container_width=True)
         st.subheader("Decision sheet"); st.json(r)
-        st.subheader("Fundamentals"); st.dataframe(pd.DataFrame([f]).T.rename(columns={0:"Value"}),use_container_width=True)
-        st.subheader("Recent announcement sample"); st.dataframe(ann,use_container_width=True,hide_index=True)
+        st.subheader("Fundamentals")
+        try:
+            ftable = safe_fundamental_rows(f)
+            st.dataframe(ftable, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Fundamental data could not be displayed safely: {e}")
+            st.json({str(k): str(v) for k, v in (f or {}).items()})
+        st.subheader("Recent announcement sample")
+        st.dataframe(ann, use_container_width=True, hide_index=True)
         st.caption("Verify material announcements against the original NSE/company disclosure before acting.")
 
 elif tab=="📊 Backtest":

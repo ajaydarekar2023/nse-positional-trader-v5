@@ -1,59 +1,47 @@
-# NSE Positional Trader V5.2.0 — Corrected Build
+# NSE Positional Trader V5.2.2
 
-Phone-first NSE positional-trading research and paper-trading dashboard.
+Phone-first NSE positional-trading research / paper-trading app built with Streamlit.
 
-## What was corrected
-- Top 20 is a ranking layer, not a filter requiring every optional data field.
-- Top 6 is selected from Top 20 using priority score plus a soft sector-concentration cap.
-- Missing fundamentals/news/weekly data do **not** silently remove a stock.
-- `UNKNOWN`, `MISSING`, `PARTIAL`, `UNAVAILABLE` statuses are shown explicitly.
-- Scan-health counters show where candidates were lost.
-- Robust handling for yfinance multi-index batch responses.
-- Official NSE Nifty 500 CSV is attempted first; a second Nifty Indices URL is attempted next; a bundled 500+ symbol snapshot is the final fallback.
-- Weekly confirmation is derived from daily history; it is never assumed bullish when unavailable.
-- Event/news enrichment is limited to a shortlist to reduce rate-limit pressure.
-- No live broker orders.
+## V5.2.2 changes
 
-## Daily workflow
-1. Open Dashboard.
-2. Tap `Scan NSE → Top 20 + Top 6`.
-3. Check `Scan health` first.
-4. Review Top 20 research candidates.
-5. Review Top 6 priority candidates.
-6. Open a candidate in Stock for the detailed decision sheet.
-7. Use the risk calculator before creating a paper position.
-8. Use the AI second-opinion prompt as a devil's advocate.
-9. Record the trade in the journal.
+1. **Scoring normalization fixed**
+   - Base score components are exactly 90 points: Trend 25 + Momentum 15 + Relative Strength 20 + Volume/Breakout 15 + Fundamentals 15.
+   - Market regime adds up to 5 points separately.
+   - Event risk is a penalty of up to 10 points.
+   - Final score is normalized against the maximum score available in the current regime, so 100 really means the maximum achievable score for that regime.
 
-## Scoring
-Displayed V5 score is normalized to a 0–100 scale and is based on:
-- Trend: 25
-- Momentum: 15
-- Relative strength vs NIFTY: 10
-- Sector relative strength: 10
-- Volume/breakout: 15
-- Fundamentals: 15
-- Regime adjustment: up to 5
-- Event risk: up to -10
+2. **Sector relative strength fixed**
+   - Sector RS is calculated against the median 63-day return of eligible stocks in the same mapped sector.
+   - A stock is never compared against itself as its only sector peer.
+   - If there are fewer than two eligible sector peers, Sector RS is explicitly treated as unavailable and receives a neutral 5/10 rather than a misleading 0 or self-comparison.
 
-The maximum component total before event penalty is 95; the displayed score is normalized to 100. Missing fundamentals are neutral-filled for ranking and clearly flagged; they are not treated as a failed stock.
+3. **Smarter stop-loss / target logic**
+   - Compares a 2×ATR stop with a 20-session swing-low stop buffered by 0.25×ATR.
+   - Uses the tighter valid structural stop when it falls within configured 1%–12% distance limits.
+   - Falls back to a bounded ATR stop if both structural choices are unsuitable.
+   - Target remains a configurable 2R by default.
+   - Displays Stop Method, Stop Distance %, Risk/Share and R Multiple.
 
-## Top 6 priority
-`Priority Score = 60% V5 Score + 25% Entry Quality + 15% Priority Fit`.
-A soft sector cap of two names is used when constructing the Top 6 so the shortlist is less likely to be dominated by one sector.
+4. **Liquidity filter added**
+   - Latest close must be **≤ ₹15,000**.
+   - 20-day average traded value must be **≥ ₹5 crore/day**.
+   - 20-day median traded value must be **≥ ₹2 crore/day**.
+   - At least **90% of the last 20 sessions must have positive volume**.
+   - Illiquid / price-ineligible stocks are excluded from the Top 20 / Top 6 candidate pool.
 
-## Data
-Default free mode uses Yahoo Finance for price/fundamental fields and best-effort public NSE endpoints for corporate announcements. This is not a licensed NSE real-time feed. Always verify important corporate events using original NSE/company disclosures.
+5. **Data-health diagnostics**
+   - Shows universe size, price data availability, price/liquidity eligible count, exclusions, rankable count, enrichment count, failures and Top 20 returned.
 
-The official NSE page documents a downloadable Nifty 500 constituent CSV. The application attempts the official NSE archive first. The bundled fallback is a snapshot and may become stale; the app labels whether the online or fallback universe was used.
+6. **Fundamentals display fix retained**
+   - Handles scalar, list, array and dictionary values safely.
 
-## Deployment
-Upload these files to the existing GitHub repository:
-- `streamlit_app.py`
-- `requirements.txt`
-- `data/nifty500_symbols.csv` (optional; V5.2 has a larger embedded fallback)
+## Default workflow
 
-Then redeploy/restart the existing Streamlit app. Do not create a second Streamlit app.
+NSE universe → price/volume validation → liquidity/price filter → technical scoring → fundamentals/event enrichment → Top 20 → Top 6 priority → risk calculation → AI second opinion → paper portfolio → journal.
 
-## Safety
-This is research/paper-trading software. Scores, backtests and AI outputs are not guarantees of future returns. Do not use the shortlist as an automatic buy list. No live broker orders are placed.
+## Important
+
+- This is research/paper-trading software, not a live broker execution system.
+- Public/free market-data sources can be delayed, incomplete, stale or rate-limited.
+- Corporate announcements should be verified against the original NSE/company disclosure.
+- A Top 20 or Top 6 ranking is not a guaranteed buy signal.
