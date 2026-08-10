@@ -1,0 +1,2 @@
+V5.2.6
+Nifty 200 universe migration only; V5.2.5 scoring, risk, analysis, journal, AI and scanner logic retained.

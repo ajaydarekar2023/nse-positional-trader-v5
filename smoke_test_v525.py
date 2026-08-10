@@ -1,4 +1,4 @@
-"""Lightweight V5.2.5 regression smoke test.
+"""Lightweight V5.2.6 regression + Nifty 200 smoke test.
 Run with: python smoke_test_v525.py
 This test avoids network calls by stubbing provider-dependent functions.
 """
@@ -29,4 +29,4 @@ r2, *_ = ns['signal']('TEST.NS')
 assert r2['Stop'] < r2['Entry'] < r2['Target']
 for fn in ['score_trend','score_momentum','score_volume','entry_quality','weekly_status','daily_status']:
     ns[fn](dict(r))
-print('V5.2.5 regression smoke test passed')
+print('V5.2.6 regression + Nifty 200 smoke test passed')

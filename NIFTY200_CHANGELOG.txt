@@ -1,0 +1,24 @@
+V5.2.6 — cautious Nifty 200 universe migration
+
+Changed only the research universe plumbing:
+- PRIMARY_UNIVERSE_URL -> Nifty 200
+- SECONDARY_UNIVERSE_URL -> Nifty 200
+- NIFTY_URL -> Nifty 200 (reserved/future use; current benchmark logic remains Nifty 50)
+- Online constituent acceptance threshold -> 180 symbols minimum
+- Bundled fallback -> 200-symbol Nifty 200 snapshot
+- UI wording -> Nifty 200
+- Version -> V5.2.6
+
+Intentionally unchanged:
+- score formulas/weights
+- Top 20 and Top 6 logic
+- price <= Rs 15,000 filter
+- liquidity filters
+- stop/target formulas
+- fundamental handling
+- single-stock analysis
+- AI packet
+- custom scanner
+- backtest
+- portfolio/journal
+- Nifty 50 market-regime benchmark
