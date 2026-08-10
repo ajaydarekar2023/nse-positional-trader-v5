@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="NSE Positional Trader V5.2", page_icon="📈", layout="centered")
+st.set_page_config(page_title="NSE Positional Trader V5.2.3", page_icon="📈", layout="centered")
 st.markdown("""
 <style>
 .block-container{max-width:1100px;padding:.55rem .65rem 2rem}
@@ -22,7 +22,7 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.2"
+APP_VERSION = "V5.2.3"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
@@ -695,10 +695,20 @@ def feature_row(sym, x, wx, history_len):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def benchmark_data():
-    d = yf.download("^NSEI", period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
-    if isinstance(d.columns, pd.MultiIndex):
-        d = extract_symbol_frame(d, "^NSEI", 1)
-    return daily_features(d[["Open","High","Low","Close","Volume"]].dropna())
+    try:
+        d = yf.download("^NSEI", period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if d is None or d.empty:
+            return pd.DataFrame()
+        if isinstance(d.columns, pd.MultiIndex):
+            d = extract_symbol_frame(d, "^NSEI", 1)
+        d.columns = [str(c).title() for c in d.columns]
+        needed=["Open","High","Low","Close","Volume"]
+        if not all(c in d.columns for c in needed):
+            return pd.DataFrame()
+        d=d[needed].apply(pd.to_numeric,errors="coerce").dropna()
+        return daily_features(d) if len(d)>=210 else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 def market_regime():
     try:
@@ -890,23 +900,47 @@ def safe_fundamental_rows(f):
         rows.append({"Metric": str(key), "Value": value})
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
+def _safe_number(value):
+    """Return a finite scalar float or NaN. Prevent provider values from breaking scoring."""
+    try:
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                return np.nan
+            value = value.reshape(-1)[0]
+        if isinstance(value, (list, tuple, set, dict)):
+            return np.nan
+        out = float(value)
+        return out if np.isfinite(out) else np.nan
+    except Exception:
+        return np.nan
+
+def _normalize_fundamentals(f):
+    """Coerce provider fundamentals to stable scalar numeric values."""
+    defaults = {
+        "P/E": np.nan, "Forward P/E": np.nan, "ROE": np.nan, "ROA": np.nan,
+        "Debt/Equity": np.nan, "Revenue growth": np.nan, "Earnings growth": np.nan,
+        "Profit margin": np.nan, "Market cap": np.nan,
+    }
+    for k in defaults:
+        defaults[k] = _safe_number((f or {}).get(k))
+    return defaults
+
 def fundamental_score(f):
     # 0-15. Missing data is neutral, not a rejection. Status is shown separately.
+    f = _normalize_fundamentals(f)
     checks = []
-    if pd.notna(f["ROE"]): checks.append(3 if f["ROE"] >= .15 else 2 if f["ROE"] >= .10 else 0)
-    if pd.notna(f["Revenue growth"]): checks.append(2 if f["Revenue growth"] > .05 else 1 if f["Revenue growth"] > 0 else 0)
-    if pd.notna(f["Earnings growth"]): checks.append(2 if f["Earnings growth"] > .05 else 1 if f["Earnings growth"] > 0 else 0)
-    if pd.notna(f["Profit margin"]): checks.append(2 if f["Profit margin"] > .10 else 1 if f["Profit margin"] > 0 else 0)
-    if pd.notna(f["Debt/Equity"]): checks.append(2 if f["Debt/Equity"] <= 100 else 1 if f["Debt/Equity"] <= 200 else 0)
-    if pd.notna(f["P/E"]): checks.append(4 if 0 < f["P/E"] < 30 else 2 if 0 < f["P/E"] < 50 else 0)
+    if np.isfinite(f["ROE"]): checks.append(3 if f["ROE"] >= .15 else 2 if f["ROE"] >= .10 else 0)
+    if np.isfinite(f["Revenue growth"]): checks.append(2 if f["Revenue growth"] > .05 else 1 if f["Revenue growth"] > 0 else 0)
+    if np.isfinite(f["Earnings growth"]): checks.append(2 if f["Earnings growth"] > .05 else 1 if f["Earnings growth"] > 0 else 0)
+    if np.isfinite(f["Profit margin"]): checks.append(2 if f["Profit margin"] > .10 else 1 if f["Profit margin"] > 0 else 0)
+    if np.isfinite(f["Debt/Equity"]): checks.append(2 if f["Debt/Equity"] <= 100 else 1 if f["Debt/Equity"] <= 200 else 0)
+    if np.isfinite(f["P/E"]): checks.append(4 if 0 < f["P/E"] < 30 else 2 if 0 < f["P/E"] < 50 else 0)
     if not checks:
         return 7.5, "MISSING"
     raw = sum(checks)
-    max_possible = 15
     coverage = min(1.0, len(checks)/6)
-    # Neutral-fill missing fields; available evidence drives the rest.
-    score = raw + (max_possible-raw)*(1-coverage)*0.5
-    return round(score, 1), "PARTIAL" if coverage < 1 else "FULL"
+    score = raw + (15-raw)*(1-coverage)*0.5
+    return round(float(score), 1), "PARTIAL" if coverage < 1 else "FULL"
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def event_risk(symbol):
@@ -993,7 +1027,7 @@ def build_ranked_candidates(base, limit=20, enrich_n=40):
             "SectorRS%": (rss_raw*100 if np.isfinite(rss_raw) else np.nan),
             "SectorPeerCount": int(r["SectorPeerCount"]), "Volume/Breakout": vol,
             "Close": r.Close, "SMA50": r.SMA50, "SMA200": r.SMA200, "RSI": r.RSI, "Vol X": r.VOL_RATIO, "ATR": r.ATR, "ATR%": r["ATR%"],
-            "BREAKOUT20": r.BREAKOUT20, "RET21": r.RET21, "RET63": r.RET63, "Weekly": ws, "WeeklyIcon": wi, "Daily": ds,
+            "BREAKOUT20": r.BREAKOUT20, "SwingLow20": r.SwingLow20, "RET21": r.RET21, "RET63": r.RET63, "Weekly": ws, "WeeklyIcon": wi, "Daily": ds,
             "Entry Quality": entry, "Breakout": breakout, "HistoryDays": r.HistoryDays,
             "AvgTradedValue20Cr": r.AvgTradedValue20Cr, "MedianTradedValue20Cr": r.MedianTradedValue20Cr,
             "ActiveVolumeDays20Pct": r.ActiveVolumeDays20Pct,
@@ -1048,7 +1082,7 @@ def build_ranked_candidates(base, limit=20, enrich_n=40):
         "breakout" if x["Breakout"] else "near/under breakout",
     ]), axis=1)
     health = {
-        "Universe": len(universe()), "Price data available": len(base) + len(excluded),
+        "Universe": len(base) + len(excluded), "Price data available": len(base) + len(excluded),
         "Price/liquidity eligible": len(base), "Excluded by price/liquidity": len(excluded),
         "Technical candidates": len(base), "Rankable candidates": len(scored),
         "Enriched candidates": enriched, "Event-enriched": min(25, enriched),
@@ -1082,25 +1116,70 @@ def select_top6(top20):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def scan_nse(limit=20):
+    """Run the full scan without allowing a provider/data anomaly to crash the app."""
     syms=universe()
-    base, failures=download_prices_batch(syms)
-    top20, health, ranked=build_ranked_candidates(base, limit=limit, enrich_n=40)
-    health["Download failures"] = len(failures)
-    health["Failed symbols sample"] = ", ".join(symbol_clean(x) for x in failures[:12])
-    return top20, select_top6(top20), health, ranked
+    try:
+        base, failures=download_prices_batch(syms)
+        top20, health, ranked=build_ranked_candidates(base, limit=limit, enrich_n=40)
+        health = health or {}
+        health["Download failures"] = len(failures)
+        health["Failed symbols sample"] = ", ".join(symbol_clean(x) for x in failures[:12])
+        health["Status"] = "OK" if not top20.empty else "NO_RANKABLE_CANDIDATES"
+        return top20, select_top6(top20), health, ranked
+    except Exception as e:
+        health={
+            "Universe": len(syms), "Price data available": 0, "Price/liquidity eligible": 0,
+            "Excluded by price/liquidity": 0, "Technical candidates": 0, "Rankable candidates": 0,
+            "Enriched candidates": 0, "Event-enriched": 0, "Top 20 returned": 0,
+            "Download failures": 0, "Failed symbols sample": "",
+            "Data source": load_universe()[1], "Data mode": load_universe()[2],
+            "Status": "SCAN_ERROR", "Error": f"{type(e).__name__}: {e}"
+        }
+        return pd.DataFrame(), pd.DataFrame(), health, pd.DataFrame()
+
+def load_single_price_history(symbol, period="2y"):
+    """Safely load one NSE equity history and return a clean OHLCV frame."""
+    sym = nse_symbol(symbol)
+    try:
+        d = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+    except Exception as e:
+        raise ValueError(f"Market data could not be downloaded for {symbol_clean(sym)}: {type(e).__name__}")
+    if d is None or d.empty:
+        raise ValueError(f"No market data available for {symbol_clean(sym)} right now.")
+    try:
+        if isinstance(d.columns, pd.MultiIndex):
+            d = extract_symbol_frame(d, sym, 1)
+        d.columns = [str(c).title() for c in d.columns]
+        needed = ["Open","High","Low","Close","Volume"]
+        if not all(c in d.columns for c in needed):
+            raise ValueError("The data provider returned an unexpected OHLCV format.")
+        d = d[needed].apply(pd.to_numeric, errors="coerce").dropna()
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Market data format error for {symbol_clean(sym)}: {type(e).__name__}")
+    if len(d) < 210:
+        raise ValueError(f"Insufficient price history for {symbol_clean(sym)}: only {len(d)} sessions available.")
+    return d
 
 def signal(symbol):
     sym=nse_symbol(symbol)
-    d=yf.download(sym, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
-    if isinstance(d.columns,pd.MultiIndex): d=extract_symbol_frame(d,sym,1)
-    d=d[["Open","High","Low","Close","Volume"]].dropna()
-    f=daily_features(d); x=f.iloc[-1]
-    ok, reason = liquidity_status(feature_row(sym, x, weekly_features(d).iloc[-1] if not weekly_features(d).empty else None, len(d)))
-    if not ok:
-        raise ValueError(f"{symbol_clean(sym)} is excluded by V5.2.2 eligibility rules: {reason}")
+    d=load_single_price_history(sym, period="2y")
+    f=daily_features(d)
+    if f.empty:
+        raise ValueError(f"Not enough clean technical data for {symbol_clean(sym)}.")
+    x=f.iloc[-1]
     w=weekly_features(d); wx=w.iloc[-1] if not w.empty else None
-    bench=benchmark_data().iloc[-1]
     r=feature_row(sym,x,wx,len(d))
+    ok, reason = liquidity_status(r)
+    if not ok:
+        raise ValueError(f"{symbol_clean(sym)} is excluded by V5.2.3 eligibility rules: {reason}")
+    try:
+        bench_df=benchmark_data()
+        bench=bench_df.iloc[-1] if not bench_df.empty else None
+        bench_ret=float(bench.RET63) if bench is not None and np.isfinite(bench.RET63) else 0.0
+    except Exception:
+        bench_ret=0.0
     # Use the already-scanned universe when available for a robust sector benchmark.
     sector_median=None; peer_count=0
     try:
@@ -1111,15 +1190,19 @@ def signal(symbol):
                 sector_median=float(peers["RET63"].median()); peer_count=len(peers)
     except Exception:
         pass
-    if sector_median is None:
-        sector_median=float(r["RET63"]); peer_count=1
-    trend=score_trend(pd.Series(r)); mom=score_momentum(pd.Series(r)); rsn,rss,rsnr,rsstr=score_relative(pd.Series(r),float(bench.RET63), None if peer_count<2 else sector_median); vol,br=score_volume(pd.Series(r))
+    trend=score_trend(pd.Series(r)); mom=score_momentum(pd.Series(r))
+    rsn,rss,rsnr,rsstr=score_relative(pd.Series(r),bench_ret,sector_median if peer_count>=2 else None)
+    vol,br=score_volume(pd.Series(r))
     fq,fstatus=fundamental_score(fundamentals(sym)); regime,_,_=market_regime(); pen,hits,ann,estate=event_risk(sym)
-    max_regime=5.0 if regime=="BULL" else 2.5 if regime=="NEUTRAL" else 0.0; max_score=90.0+max_regime
+    max_regime=5.0 if regime=="BULL" else 2.5 if regime=="NEUTRAL" else 0.0
+    max_score=90.0+max_regime
     score=float(np.clip((trend+mom+rsn+rss+vol+fq+max_regime-pen)/max_score*100,0,100))
     stp=derive_stop_target(d,entry=float(x.Close))
     ws,wi=weekly_status(pd.Series(r)); ds,di=daily_status(pd.Series(r))
-    return {"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2) if np.isfinite(rsstr) else None,"Sector peer count":peer_count,"RSI":round(x.RSI,1),"Vol X":round(x.VOL_RATIO,2),"ATR %":round(x["ATR%"],2),"20D avg traded value ₹Cr":round(x.AVG_TRADED_VALUE20/1e7,2),"20D median traded value ₹Cr":round(x.MEDIAN_TRADED_VALUE20/1e7,2),"Active volume days %":round(x.ACTIVE_VOLUME_DAYS20,1),"Weekly":ws,"Daily":ds,"Entry Quality":entry_quality(pd.Series(r)),"Entry":round(float(x.Close),2),**stp,"Event hits":hits}, d, f, ann
+    eq=entry_quality(pd.Series(r))
+    signal_name="PRIORITY CANDIDATE" if score>=75 and regime!="BEAR" else "WATCH"
+    result={"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2) if np.isfinite(rsstr) else None,"Sector peer count":peer_count,"RSI":round(float(x.RSI),1),"Vol X":round(float(x.VOL_RATIO),2),"ATR %":round(float(x["ATR%"]),2),"20D avg traded value ₹Cr":round(float(x.AVG_TRADED_VALUE20/1e7),2),"20D median traded value ₹Cr":round(float(x.MEDIAN_TRADED_VALUE20/1e7),2),"Active volume days %":round(float(x.ACTIVE_VOLUME_DAYS20),1),"Weekly":ws,"Daily":ds,"Entry Quality":eq,"Entry":round(float(x.Close),2),"Signal":signal_name,"DataQuality":100.0 if fstatus=="FULL" else 90.0 if fstatus=="PARTIAL" else 80.0,**stp,"Event hits":hits}
+    return result, d, fundamentals(sym), ann
 
 def risk_size(cap,riskpct,entry,stop,maxpos):
     rps=abs(entry-stop); budget=cap*riskpct/100; shares=int(budget/rps) if rps else 0
@@ -1129,9 +1212,10 @@ def risk_size(cap,riskpct,entry,stop,maxpos):
 def costs(value, bps): return value*bps/10000
 
 def backtest(sym,initial,riskpct,maxpos,fee_bps,slip_bps):
-    d=yf.download(nse_symbol(sym),period="5y",interval="1d",auto_adjust=False,progress=False,threads=False)
-    if isinstance(d.columns,pd.MultiIndex): d=extract_symbol_frame(d,nse_symbol(sym),1)
-    d=d[["Open","High","Low","Close","Volume"]].dropna(); d= daily_features(d)
+    d=load_single_price_history(sym, period="5y")
+    d=daily_features(d)
+    if d.empty or len(d) < 210:
+        raise ValueError("Insufficient history for backtest.")
     cash=initial;pos=None;trades=[];equity=[]
     for i in range(200,len(d)-1):
         r=d.iloc[i]
@@ -1176,7 +1260,7 @@ def make_ai_prompt(snapshot):
     return f"""You are a skeptical NSE positional-trading research assistant.\n\nHolding period: 2–12 weeks.\n\nMachine snapshot:\n{json.dumps(snapshot,indent=2,default=str)}\n\nUse current, verifiable information and official company disclosures where possible. Separate FACTS from INTERPRETATION. Do not invent missing figures. Do not give guaranteed returns or a future price prediction.\n\nChallenge this setup rather than simply agreeing with it. Review: market regime, weekly/daily trend alignment, relative strength vs NIFTY and sector, breakout quality, volume, RSI, valuation, earnings/revenue growth, ROE/ROCE, leverage/cash flow, promoter/institutional information when verified, recent corporate announcements, event risks, liquidity, and portfolio concentration.\n\nReturn:\n1) Evidence table\n2) Bull case\n3) Bear case\n4) Strongest reasons NOT to take the trade\n5) What would invalidate the setup\n6) Missing/uncertain information\n7) WATCH / PRIORITY-CANDIDATE / AVOID\n8) Confidence level and why\n"""
 
 st.title(f"📈 NSE Positional Trader {APP_VERSION}")
-st.caption("Corrected production research build • Top 20 → Top 6 • data-health diagnostics • no live orders")
+st.caption("Stability release • Top 20 → Top 6 • robust data handling • no live orders")
 
 if st.button("🔄 Refresh all cached data"):
     st.cache_data.clear(); st.session_state.pop("scan",None); st.rerun()
@@ -1191,7 +1275,7 @@ if tab=="🏠 Dashboard":
     else:
         c1.metric("NIFTY 50","Unavailable"); c3.metric("Benchmark data","Unavailable")
     c2.metric("Regime",f"{ico} {rg}")
-    st.info("V5.2 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
+    st.info("V5.2.3 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
     st.subheader("🚀 One-tap NSE scan")
     st.write("Scan the full available Nifty 500 universe, rank the best 20 candidates, then select a diversified Top 6 priority list.")
     if st.button("🚀 Scan NSE → Top 20 + Top 6",key="dashscan"):
@@ -1210,13 +1294,19 @@ if tab=="🏠 Dashboard":
             st.warning("Fewer than 20 candidates were rankable. This is a data-availability limitation, not a reason to invent rows.")
         st.subheader("🏆 Top 20 research shortlist")
         display=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target","Signal"]
-        st.dataframe(top20[display],use_container_width=True,hide_index=True)
-        st.download_button("⬇️ Export Top 20",top20.to_csv(index=False),"v5_2_top20.csv","text/csv",key="top20csv")
+        if top20.empty:
+            st.warning(f"No candidates could be ranked. Status: {health.get('Status','UNKNOWN')}. {health.get('Error','Check Scan Health and data availability.')}")
+        else:
+            st.dataframe(top20[[c for c in display if c in top20.columns]],use_container_width=True,hide_index=True)
+            st.download_button("⬇️ Export Top 20",top20.to_csv(index=False),"v5_2_top20.csv","text/csv",key="top20csv")
         st.subheader("🎯 Top 6 priority setups")
         st.caption("Priority = 60% V5 score + 25% entry quality + 15% regime/portfolio fit, with a soft sector concentration cap of two names per sector.")
         display6=["Priority Rank","Symbol","Sector","PriorityScore","Score","Entry Quality","PriorityFit","Weekly","Daily","RS vs NIFTY","Vol X","Fundamental","EventPenalty","Entry","Stop","Target","Signal"]
-        st.dataframe(top6[display6],use_container_width=True,hide_index=True)
-        st.download_button("⬇️ Export Top 6",top6.to_csv(index=False),"v5_2_top6.csv","text/csv",key="top6csv")
+        if top6.empty:
+            st.info("Top 6 is unavailable until at least one candidate is rankable.")
+        else:
+            st.dataframe(top6[[c for c in display6 if c in top6.columns]],use_container_width=True,hide_index=True)
+            st.download_button("⬇️ Export Top 6",top6.to_csv(index=False),"v5_2_top6.csv","text/csv",key="top6csv")
         st.subheader("🔔 Alerts")
         alerts=build_alerts(top20)
         if alerts:
@@ -1234,12 +1324,20 @@ elif tab=="🏆 Top 20/Top 6":
     else:
         top20,top6,health,ranked=st.session_state["scan"]
         st.write("### Top 20 research list")
-        st.dataframe(top20[["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality"]],use_container_width=True,hide_index=True)
+        if top20.empty:
+            st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
+        else:
+            cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality"]
+            st.dataframe(top20[[c for c in cols20 if c in top20.columns]],use_container_width=True,hide_index=True)
         st.write("### Top 6 priority list")
-        st.dataframe(top6[["Priority Rank","Symbol","Sector","PriorityScore","Score","Entry Quality","PriorityFit","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","EventPenalty"]],use_container_width=True,hide_index=True)
-        st.write("### Why the candidates ranked")
-        for _,r in top6.iterrows():
-            st.write(f"**{int(r['Priority Rank'])}. {r['Symbol']}** — {r['Why']}")
+        if top6.empty:
+            st.info("No Top 6 candidates available.")
+        else:
+            cols6=["Priority Rank","Symbol","Sector","PriorityScore","Score","Entry Quality","PriorityFit","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","EventPenalty"]
+            st.dataframe(top6[[c for c in cols6 if c in top6.columns]],use_container_width=True,hide_index=True)
+            st.write("### Why the candidates ranked")
+            for _,r in top6.iterrows():
+                st.write(f"**{int(r['Priority Rank'])}. {r['Symbol']}** — {r['Why']}")
         st.write("### 🔔 Alerts")
         alerts=build_alerts(top20)
         if alerts: st.dataframe(pd.DataFrame(alerts),use_container_width=True,hide_index=True)
@@ -1256,7 +1354,11 @@ elif tab=="🔎 Scanner":
         if "scan" in st.session_state:
             top20,top6,health,ranked=st.session_state["scan"]
             st.json(health)
-            st.dataframe(top20[["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]],use_container_width=True,hide_index=True)
+            if top20.empty:
+                st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
+            else:
+                cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]
+                st.dataframe(top20[[c for c in cols20 if c in top20.columns]],use_container_width=True,hide_index=True)
     else:
         sel=st.multiselect("Select stocks",u,default=u[:10])
         if st.button("🚀 Run custom scanner",key="custom"):
