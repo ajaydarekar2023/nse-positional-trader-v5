@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="NSE Positional Trader V5.2.3", page_icon="📈", layout="centered")
+st.set_page_config(page_title="NSE Positional Trader V5.2.5", page_icon="📈", layout="centered")
 st.markdown("""
 <style>
 .block-container{max-width:1100px;padding:.55rem .65rem 2rem}
@@ -22,7 +22,7 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.3"
+APP_VERSION = "V5.2.5"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
@@ -644,79 +644,82 @@ def extract_symbol_frame(raw, sym, chunk_len):
     return d[needed].dropna(how="all")
 
 def daily_features(d):
-    d = d.copy().sort_index()
-    d["SMA20"] = d.Close.rolling(20).mean()
-    d["SMA50"] = d.Close.rolling(50).mean()
-    d["SMA200"] = d.Close.rolling(200).mean()
-    delta = d.Close.diff()
+    d = _clean_ohlcv_frame(d) if not (isinstance(d, pd.DataFrame) and all(c in d.columns for c in ["Open","High","Low","Close","Volume"])) else d.copy()
+    d = d.sort_index()
+    if d.empty:
+        return pd.DataFrame()
+    d["SMA20"] = d["Close"].rolling(20).mean()
+    d["SMA50"] = d["Close"].rolling(50).mean()
+    d["SMA200"] = d["Close"].rolling(200).mean()
+    delta = d["Close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     d["RSI"] = 100 - 100/(1 + gain/loss.replace(0, np.nan))
-    prev = d.Close.shift()
-    tr = pd.concat([(d.High-d.Low), (d.High-prev).abs(), (d.Low-prev).abs()], axis=1).max(axis=1)
+    prev = d["Close"].shift()
+    tr = pd.concat([(d["High"]-d["Low"]), (d["High"]-prev).abs(), (d["Low"]-prev).abs()], axis=1).max(axis=1)
     d["ATR"] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    d["ATR%"] = 100*d.ATR/d.Close
-    d["VOL20"] = d.Volume.rolling(20).mean()
-    d["VOL_RATIO"] = d.Volume/d.VOL20
-    d["TRADED_VALUE"] = d.Close * d.Volume
-    d["AVG_TRADED_VALUE20"] = d.TRADED_VALUE.rolling(20).mean()
-    d["MEDIAN_TRADED_VALUE20"] = d.TRADED_VALUE.rolling(20).median()
-    d["ACTIVE_VOLUME_DAYS20"] = d.Volume.gt(0).rolling(20).mean() * 100
-    d["BREAKOUT20"] = d.High.rolling(20).max().shift(1)
-    d["SWING_LOW20"] = d.Low.rolling(SWING_LOOKBACK).min().shift(1)
-    d["RET21"] = d.Close.pct_change(21)
-    d["RET63"] = d.Close.pct_change(63)
+    d["ATR%"] = 100*d["ATR"]/d["Close"]
+    d["VOL20"] = d["Volume"].rolling(20).mean()
+    d["VOL_RATIO"] = d["Volume"]/d["VOL20"]
+    d["TRADED_VALUE"] = d["Close"] * d["Volume"]
+    d["AVG_TRADED_VALUE20"] = d["TRADED_VALUE"].rolling(20).mean()
+    d["MEDIAN_TRADED_VALUE20"] = d["TRADED_VALUE"].rolling(20).median()
+    d["ACTIVE_VOLUME_DAYS20"] = d["Volume"].gt(0).rolling(20).mean() * 100
+    d["BREAKOUT20"] = d["High"].rolling(20).max().shift(1)
+    d["SWING_LOW20"] = d["Low"].rolling(SWING_LOOKBACK).min().shift(1)
+    d["RET21"] = d["Close"].pct_change(21)
+    d["RET63"] = d["Close"].pct_change(63)
     return d.dropna(subset=["SMA20","SMA50","SMA200","RSI","ATR","ATR%","VOL20","VOL_RATIO","BREAKOUT20","SWING_LOW20","RET21","RET63","AVG_TRADED_VALUE20","MEDIAN_TRADED_VALUE20","ACTIVE_VOLUME_DAYS20"])
 
 def weekly_features(d):
     w = d.resample("W-FRI").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
     if len(w) < 40:
         return pd.DataFrame()
-    w["SMA20W"] = w.Close.rolling(20).mean()
-    w["SMA40W"] = w.Close.rolling(40).mean()
-    w["RET12W"] = w.Close.pct_change(12)
+    w["SMA20W"] = w["Close"].rolling(20).mean()
+    w["SMA40W"] = w["Close"].rolling(40).mean()
+    w["RET12W"] = w["Close"].pct_change(12)
     return w.dropna(subset=["SMA20W","SMA40W","RET12W"])
 
 def feature_row(sym, x, wx, history_len):
     return {
         "Symbol": symbol_clean(sym), "_symbol": sym, "Sector": sector(sym),
-        "Close": float(x.Close), "SMA20": float(x.SMA20), "SMA50": float(x.SMA50), "SMA200": float(x.SMA200),
-        "RSI": float(x.RSI), "ATR": float(x.ATR), "ATR%": float(x["ATR%"]), "VOL_RATIO": float(x.VOL_RATIO),
-        "BREAKOUT20": float(x.BREAKOUT20), "SwingLow20": float(x.SWING_LOW20), "RET21": float(x.RET21), "RET63": float(x.RET63),
-        "AvgTradedValue20Cr": float(x.AVG_TRADED_VALUE20)/1e7,
-        "MedianTradedValue20Cr": float(x.MEDIAN_TRADED_VALUE20)/1e7,
-        "ActiveVolumeDays20Pct": float(x.ACTIVE_VOLUME_DAYS20),
-        "WeeklyClose": float(wx.Close) if wx is not None else np.nan,
-        "WeeklySMA20": float(wx.SMA20W) if wx is not None else np.nan,
-        "WeeklySMA40": float(wx.SMA40W) if wx is not None else np.nan,
-        "WeeklyRet12": float(wx.RET12W) if wx is not None else np.nan,
+        "Close": float(x["Close"]), "SMA20": float(x["SMA20"]), "SMA50": float(x["SMA50"]), "SMA200": float(x["SMA200"]),
+        "RSI": float(x["RSI"]), "ATR": float(x["ATR"]), "ATR%": float(x["ATR%"]), "VOL_RATIO": float(x["VOL_RATIO"]),
+        "BREAKOUT20": float(x["BREAKOUT20"]), "SwingLow20": float(x["SWING_LOW20"]), "RET21": float(x["RET21"]), "RET63": float(x["RET63"]),
+        "AvgTradedValue20Cr": float(x["AVG_TRADED_VALUE20"])/1e7,
+        "MedianTradedValue20Cr": float(x["MEDIAN_TRADED_VALUE20"])/1e7,
+        "ActiveVolumeDays20Pct": float(x["ACTIVE_VOLUME_DAYS20"]),
+        "WeeklyClose": float(wx["Close"]) if wx is not None else np.nan,
+        "WeeklySMA20": float(wx["SMA20W"]) if wx is not None else np.nan,
+        "WeeklySMA40": float(wx["SMA40W"]) if wx is not None else np.nan,
+        "WeeklyRet12": float(wx["RET12W"]) if wx is not None else np.nan,
         "HistoryDays": int(history_len),
     }
 
 @st.cache_data(ttl=900, show_spinner=False)
 def benchmark_data():
-    try:
-        d = yf.download("^NSEI", period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
-        if d is None or d.empty:
-            return pd.DataFrame()
-        if isinstance(d.columns, pd.MultiIndex):
-            d = extract_symbol_frame(d, "^NSEI", 1)
-        d.columns = [str(c).title() for c in d.columns]
-        needed=["Open","High","Low","Close","Volume"]
-        if not all(c in d.columns for c in needed):
-            return pd.DataFrame()
-        d=d[needed].apply(pd.to_numeric,errors="coerce").dropna()
-        return daily_features(d) if len(d)>=210 else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+    """Load NIFTY benchmark through the same defensive OHLCV normalizer."""
+    for loader in ("history", "download"):
+        try:
+            if loader == "history":
+                d = yf.Ticker("^NSEI").history(period="2y", interval="1d", auto_adjust=False)
+            else:
+                d = yf.download("^NSEI", period="2y", interval="1d", auto_adjust=False, progress=False, threads=False)
+            d = _clean_ohlcv_frame(d, "^NSEI")
+            if len(d) >= 210:
+                out = daily_features(d)
+                return out if len(out) >= 10 else pd.DataFrame()
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 def market_regime():
     try:
         d = benchmark_data()
         x = d.iloc[-1]
-        if x.Close > x.SMA200 and x.SMA50 > x.SMA200 and x.Close > x.SMA50:
+        if x["Close"] > x["SMA200"] and x["SMA50"] > x["SMA200"] and x["Close"] > x["SMA50"]:
             return "BULL", "🟢", x
-        if x.Close > x.SMA200:
+        if x["Close"] > x["SMA200"]:
             return "NEUTRAL", "🟡", x
         return "BEAR", "🔴", x
     except Exception:
@@ -724,7 +727,7 @@ def market_regime():
 
 def liquidity_status(r):
     """Return (eligible, reason) for positional-trading liquidity/price controls."""
-    price = float(r.Close)
+    price = float(r["Close"])
     avg_cr = float(r.get("AvgTradedValue20Cr", np.nan))
     med_cr = float(r.get("MedianTradedValue20Cr", np.nan))
     active_pct = float(r.get("ActiveVolumeDays20Pct", np.nan))
@@ -750,13 +753,13 @@ def derive_stop_target(d, entry=None, r_multiple=DEFAULT_R_MULTIPLE):
         raise ValueError("Price history is empty")
     f = d if "ATR" in d.columns else daily_features(d)
     x = f.iloc[-1]
-    entry = float(x.Close if entry is None else entry)
-    atr = float(x.ATR)
+    entry = float(x["Close"] if entry is None else entry)
+    atr = float(x["ATR"])
     if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
         raise ValueError("Invalid entry/ATR for stop calculation")
     atr_stop = entry - ATR_STOP_MULTIPLIER * atr
     recent = f.tail(SWING_LOOKBACK)
-    swing_low = float(recent.Low.min())
+    swing_low = float(recent["Low"].min())
     swing_stop = swing_low - SWING_BUFFER_ATR * atr
     candidates = [("ATR 2x", atr_stop), ("Swing low", swing_stop)]
     valid = []
@@ -817,22 +820,22 @@ def derive_stop_from_values(entry, atr, swing_low, r_multiple=DEFAULT_R_MULTIPLE
 
 def score_trend(r):
     pts = 0
-    pts += 8 if r.Close > r.SMA50 else 0
-    pts += 8 if r.SMA50 > r.SMA200 else 0
-    slope = (r.SMA50 / r.SMA200 - 1) if r.SMA200 else 0
+    pts += 8 if r["Close"] > r["SMA50"] else 0
+    pts += 8 if r["SMA50"] > r["SMA200"] else 0
+    slope = (r["SMA50"] / r["SMA200"] - 1) if r["SMA200"] else 0
     pts += 5 if slope > 0.02 else 3 if slope > 0 else 0
-    if pd.notna(r.WeeklyClose):
-        pts += 4 if r.WeeklyClose > r.WeeklySMA20 > r.WeeklySMA40 else 2 if r.WeeklyClose > r.WeeklySMA40 else 0
+    if pd.notna(r["WeeklyClose"]):
+        pts += 4 if r["WeeklyClose"] > r["WeeklySMA20"] > r["WeeklySMA40"] else 2 if r["WeeklyClose"] > r["WeeklySMA40"] else 0
     else:
         pts += 2  # neutral treatment for missing weekly data; status remains UNKNOWN
     return min(25, pts)
 
 def score_momentum(r):
-    rsi = r.RSI
+    rsi = r["RSI"]
     pts = 0
     pts += 5 if 55 <= rsi <= 68 else 3 if 50 <= rsi < 55 or 68 < rsi <= 75 else 0
-    pts += 5 if r.RET21 > 0.03 else 3 if r.RET21 > 0 else 0
-    pts += 5 if r.RET63 > 0.08 else 3 if r.RET63 > 0 else 0
+    pts += 5 if r["RET21"] > 0.03 else 3 if r["RET21"] > 0 else 0
+    pts += 5 if r["RET63"] > 0.08 else 3 if r["RET63"] > 0 else 0
     return min(15, pts)
 
 def score_relative(r, benchmark_return, sector_median_return=None):
@@ -843,22 +846,22 @@ def score_relative(r, benchmark_return, sector_median_return=None):
     are available, the sector component is explicitly marked unavailable and
     receives a neutral 5/10 rather than comparing the stock with itself.
     """
-    rs = float(r.RET63) - float(benchmark_return)
+    rs = float(r["RET63"]) - float(benchmark_return)
     if sector_median_return is None or not np.isfinite(sector_median_return):
         sector_rs = np.nan
         sector_points = 5
     else:
-        sector_rs = float(r.RET63) - float(sector_median_return)
+        sector_rs = float(r["RET63"]) - float(sector_median_return)
         sector_points = 10 if sector_rs > 0.08 else 7 if sector_rs > 0 else 3 if sector_rs > -0.05 else 0
     nifty_points = 10 if rs > 0.08 else 7 if rs > 0 else 3 if rs > -0.05 else 0
     return nifty_points, sector_points, rs, sector_rs
 
 def score_volume(r):
-    breakout = r.Close > r.BREAKOUT20
+    breakout = r["Close"] > r["BREAKOUT20"]
     pts = 0
-    pts += 5 if r.VOL_RATIO >= 1.5 else 3 if r.VOL_RATIO >= 1.0 else 0
-    pts += 5 if breakout else 2 if r.Close >= 0.98*r.BREAKOUT20 else 0
-    pts += 5 if breakout and r.VOL_RATIO >= 1.5 else 3 if r.VOL_RATIO >= 1.2 else 0
+    pts += 5 if r["VOL_RATIO"] >= 1.5 else 3 if r["VOL_RATIO"] >= 1.0 else 0
+    pts += 5 if breakout else 2 if r["Close"] >= 0.98*r["BREAKOUT20"] else 0
+    pts += 5 if breakout and r["VOL_RATIO"] >= 1.5 else 3 if r["VOL_RATIO"] >= 1.2 else 0
     return min(15, pts), breakout
 
 def fundamentals(symbol):
@@ -966,30 +969,30 @@ def event_risk(symbol):
 
 def entry_quality(r):
     score = 0
-    score += 25 if r.Close > r.SMA50 > r.SMA200 else 12 if r.Close > r.SMA200 else 0
-    distance = (r.Close/r.BREAKOUT20 - 1) if r.BREAKOUT20 else 0
+    score += 25 if r["Close"] > r["SMA50"] > r["SMA200"] else 12 if r["Close"] > r["SMA200"] else 0
+    distance = (r["Close"]/r["BREAKOUT20"] - 1) if r["BREAKOUT20"] else 0
     score += 25 if -0.01 <= distance <= 0.03 else 18 if -0.03 <= distance <= 0.06 else 8 if distance > 0.06 else 12
-    score += 20 if r.Close > r.BREAKOUT20 and r.VOL_RATIO >= 1.5 else 12 if r.Close > 0.98*r.BREAKOUT20 else 6
-    score += 15 if 55 <= r.RSI <= 68 else 10 if 50 <= r.RSI <= 75 else 4
-    score += 15 if r.VOL_RATIO >= 1.5 else 10 if r.VOL_RATIO >= 1.2 else 5
+    score += 20 if r["Close"] > r["BREAKOUT20"] and r["VOL_RATIO"] >= 1.5 else 12 if r["Close"] > 0.98*r["BREAKOUT20"] else 6
+    score += 15 if 55 <= r["RSI"] <= 68 else 10 if 50 <= r["RSI"] <= 75 else 4
+    score += 15 if r["VOL_RATIO"] >= 1.5 else 10 if r["VOL_RATIO"] >= 1.2 else 5
     return round(min(100, score), 1)
 
 def weekly_status(r):
-    if pd.isna(r.WeeklyClose): return "UNKNOWN", "⚪"
-    if r.WeeklyClose > r.WeeklySMA20 > r.WeeklySMA40: return "BULLISH", "🟢"
-    if r.WeeklyClose > r.WeeklySMA40: return "NEUTRAL", "🟡"
+    if pd.isna(r["WeeklyClose"]): return "UNKNOWN", "⚪"
+    if r["WeeklyClose"] > r["WeeklySMA20"] > r["WeeklySMA40"]: return "BULLISH", "🟢"
+    if r["WeeklyClose"] > r["WeeklySMA40"]: return "NEUTRAL", "🟡"
     return "BEARISH", "🔴"
 
 def daily_status(r):
-    if r.Close > r.SMA50 > r.SMA200: return "BULLISH", "🟢"
-    if r.Close > r.SMA200: return "NEUTRAL", "🟡"
+    if r["Close"] > r["SMA50"] > r["SMA200"]: return "BULLISH", "🟢"
+    if r["Close"] > r["SMA200"]: return "NEUTRAL", "🟡"
     return "BEARISH", "🔴"
 
 def build_ranked_candidates(base, limit=20, enrich_n=40):
     if base.empty:
         return pd.DataFrame(), {}, {}
     regime, _, bench = market_regime()
-    bench_ret = float(bench.RET63) if bench is not None else 0.0
+    bench_ret = float(bench["RET63"]) if bench is not None else 0.0
     base = base.copy()
     base["Sector"] = base["_symbol"].map(sector)
     # Robust sector benchmark: median 63D return of peers, excluding the stock itself
@@ -1026,8 +1029,8 @@ def build_ranked_candidates(base, limit=20, enrich_n=40):
             "RS vs NIFTY": rs_n, "Sector RS": rs_s, "RSNIFTY%": rsn_raw*100,
             "SectorRS%": (rss_raw*100 if np.isfinite(rss_raw) else np.nan),
             "SectorPeerCount": int(r["SectorPeerCount"]), "Volume/Breakout": vol,
-            "Close": r.Close, "SMA50": r.SMA50, "SMA200": r.SMA200, "RSI": r.RSI, "Vol X": r.VOL_RATIO, "ATR": r.ATR, "ATR%": r["ATR%"],
-            "BREAKOUT20": r.BREAKOUT20, "SwingLow20": r.SwingLow20, "RET21": r.RET21, "RET63": r.RET63, "Weekly": ws, "WeeklyIcon": wi, "Daily": ds,
+            "Close": r["Close"], "SMA50": r["SMA50"], "SMA200": r["SMA200"], "RSI": r["RSI"], "Vol X": r["VOL_RATIO"], "ATR": r["ATR"], "ATR%": r["ATR%"],
+            "BREAKOUT20": r["BREAKOUT20"], "SwingLow20": r.SwingLow20, "RET21": r["RET21"], "RET63": r["RET63"], "Weekly": ws, "WeeklyIcon": wi, "Daily": ds,
             "Entry Quality": entry, "Breakout": breakout, "HistoryDays": r.HistoryDays,
             "AvgTradedValue20Cr": r.AvgTradedValue20Cr, "MedianTradedValue20Cr": r.MedianTradedValue20Cr,
             "ActiveVolumeDays20Pct": r.ActiveVolumeDays20Pct,
@@ -1137,30 +1140,111 @@ def scan_nse(limit=20):
         }
         return pd.DataFrame(), pd.DataFrame(), health, pd.DataFrame()
 
+def _clean_ohlcv_frame(d, symbol=""):
+    """Normalize any yfinance single-symbol response into a plain OHLCV DataFrame.
+
+    yfinance can return MultiIndex columns and, depending on version/provider
+    behavior, some responses may be wrapped or otherwise non-standard. This
+    function is deliberately defensive so a single-stock analysis never tries
+    to access ["Close"] on a dict/list-like object.
+    """
+    if d is None:
+        return pd.DataFrame()
+    if isinstance(d, dict):
+        # Handle common wrapper shapes without assuming a specific provider version.
+        for key in (symbol, symbol_clean(symbol), nse_symbol(symbol), "data", "history", "prices"):
+            if key in d:
+                candidate = d[key]
+                if isinstance(candidate, pd.DataFrame):
+                    d = candidate
+                    break
+        else:
+            # A dict of column -> values can still be converted safely.
+            try:
+                d = pd.DataFrame(d)
+            except Exception:
+                return pd.DataFrame()
+    if isinstance(d, pd.Series):
+        try:
+            d = d.to_frame().T
+        except Exception:
+            return pd.DataFrame()
+    if not isinstance(d, pd.DataFrame) or d.empty:
+        return pd.DataFrame()
+
+    d = d.copy()
+    if isinstance(d.columns, pd.MultiIndex):
+        # Prefer the ticker level when present; otherwise flatten field names.
+        levels = [list(map(str, d.columns.get_level_values(i))) for i in range(d.columns.nlevels)]
+        target = nse_symbol(symbol)
+        selected = None
+        for level in range(d.columns.nlevels):
+            if target in levels[level]:
+                try:
+                    selected = d.xs(target, axis=1, level=level, drop_level=True).copy()
+                    break
+                except Exception:
+                    pass
+        if selected is not None:
+            d = selected
+        else:
+            # If only one ticker exists, flatten the remaining field level.
+            d.columns = [str(c[-1] if isinstance(c, tuple) else c) for c in d.columns]
+
+    # Normalize common casing/naming variants.
+    rename = {}
+    for c in d.columns:
+        raw = str(c).strip().lower().replace(" ", "")
+        mapping = {"open":"Open", "high":"High", "low":"Low", "close":"Close",
+                   "adjclose":"Adj Close", "volume":"Volume"}
+        if raw in mapping:
+            rename[c] = mapping[raw]
+    d = d.rename(columns=rename)
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in d.columns for c in needed):
+        return pd.DataFrame()
+    d = d[needed].apply(pd.to_numeric, errors="coerce")
+    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=["Open","High","Low","Close"])
+    # Volume can occasionally be missing; use zero rather than destroying the
+    # price history. Liquidity rules will then correctly reject the stock.
+    d["Volume"] = d["Volume"].fillna(0)
+    try:
+        d.index = pd.to_datetime(d.index)
+        if getattr(d.index, "tz", None) is not None:
+            d.index = d.index.tz_localize(None)
+    except Exception:
+        pass
+    return d.sort_index()
+
 def load_single_price_history(symbol, period="2y"):
-    """Safely load one NSE equity history and return a clean OHLCV frame."""
+    """Safely load one NSE equity history using Ticker.history first.
+
+    Ticker.history is used for single-stock analysis because it avoids several
+    MultiIndex/wrapper edge cases seen with yf.download across yfinance versions.
+    A download fallback is retained for resilience.
+    """
     sym = nse_symbol(symbol)
+    errors = []
+    try:
+        d = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=False)
+        d = _clean_ohlcv_frame(d, sym)
+        if not d.empty:
+            if len(d) < 210:
+                errors.append(f"only {len(d)} sessions from Ticker.history")
+            else:
+                return d
+    except Exception as e:
+        errors.append(f"Ticker.history: {type(e).__name__}")
     try:
         d = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+        d = _clean_ohlcv_frame(d, sym)
+        if not d.empty and len(d) >= 210:
+            return d
+        errors.append(f"download returned {len(d)} clean sessions")
     except Exception as e:
-        raise ValueError(f"Market data could not be downloaded for {symbol_clean(sym)}: {type(e).__name__}")
-    if d is None or d.empty:
-        raise ValueError(f"No market data available for {symbol_clean(sym)} right now.")
-    try:
-        if isinstance(d.columns, pd.MultiIndex):
-            d = extract_symbol_frame(d, sym, 1)
-        d.columns = [str(c).title() for c in d.columns]
-        needed = ["Open","High","Low","Close","Volume"]
-        if not all(c in d.columns for c in needed):
-            raise ValueError("The data provider returned an unexpected OHLCV format.")
-        d = d[needed].apply(pd.to_numeric, errors="coerce").dropna()
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Market data format error for {symbol_clean(sym)}: {type(e).__name__}")
-    if len(d) < 210:
-        raise ValueError(f"Insufficient price history for {symbol_clean(sym)}: only {len(d)} sessions available.")
-    return d
+        errors.append(f"download: {type(e).__name__}")
+    detail = "; ".join(errors[-3:])
+    raise ValueError(f"No usable market data for {symbol_clean(sym)}. {detail}")
 
 def signal(symbol):
     sym=nse_symbol(symbol)
@@ -1173,11 +1257,11 @@ def signal(symbol):
     r=feature_row(sym,x,wx,len(d))
     ok, reason = liquidity_status(r)
     if not ok:
-        raise ValueError(f"{symbol_clean(sym)} is excluded by V5.2.3 eligibility rules: {reason}")
+        raise ValueError(f"{symbol_clean(sym)} is excluded by V5.2.5 eligibility rules: {reason}")
     try:
         bench_df=benchmark_data()
         bench=bench_df.iloc[-1] if not bench_df.empty else None
-        bench_ret=float(bench.RET63) if bench is not None and np.isfinite(bench.RET63) else 0.0
+        bench_ret=float(bench["RET63"]) if bench is not None and np.isfinite(bench["RET63"]) else 0.0
     except Exception:
         bench_ret=0.0
     # Use the already-scanned universe when available for a robust sector benchmark.
@@ -1197,11 +1281,11 @@ def signal(symbol):
     max_regime=5.0 if regime=="BULL" else 2.5 if regime=="NEUTRAL" else 0.0
     max_score=90.0+max_regime
     score=float(np.clip((trend+mom+rsn+rss+vol+fq+max_regime-pen)/max_score*100,0,100))
-    stp=derive_stop_target(d,entry=float(x.Close))
+    stp=derive_stop_target(d,entry=float(x["Close"]))
     ws,wi=weekly_status(pd.Series(r)); ds,di=daily_status(pd.Series(r))
     eq=entry_quality(pd.Series(r))
     signal_name="PRIORITY CANDIDATE" if score>=75 and regime!="BEAR" else "WATCH"
-    result={"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2) if np.isfinite(rsstr) else None,"Sector peer count":peer_count,"RSI":round(float(x.RSI),1),"Vol X":round(float(x.VOL_RATIO),2),"ATR %":round(float(x["ATR%"]),2),"20D avg traded value ₹Cr":round(float(x.AVG_TRADED_VALUE20/1e7),2),"20D median traded value ₹Cr":round(float(x.MEDIAN_TRADED_VALUE20/1e7),2),"Active volume days %":round(float(x.ACTIVE_VOLUME_DAYS20),1),"Weekly":ws,"Daily":ds,"Entry Quality":eq,"Entry":round(float(x.Close),2),"Signal":signal_name,"DataQuality":100.0 if fstatus=="FULL" else 90.0 if fstatus=="PARTIAL" else 80.0,**stp,"Event hits":hits}
+    result={"Symbol":symbol_clean(sym),"Sector":sector(sym),"Score":round(score,1),"Trend":trend,"Momentum":mom,"RS vs NIFTY":rsn,"Sector RS":rss,"Volume/Breakout":vol,"Fundamental":fq,"Fundamental status":fstatus,"Event penalty":pen,"Event status":estate,"RS vs NIFTY %":round(rsnr*100,2),"Sector RS %":round(rsstr*100,2) if np.isfinite(rsstr) else None,"Sector peer count":peer_count,"RSI":round(float(x["RSI"]),1),"Vol X":round(float(x["VOL_RATIO"]),2),"ATR %":round(float(x["ATR%"]),2),"20D avg traded value ₹Cr":round(float(x["AVG_TRADED_VALUE20"]/1e7),2),"20D median traded value ₹Cr":round(float(x["MEDIAN_TRADED_VALUE20"]/1e7),2),"Active volume days %":round(float(x["ACTIVE_VOLUME_DAYS20"]),1),"Weekly":ws,"Daily":ds,"Entry Quality":eq,"Entry":round(float(x["Close"]),2),"Signal":signal_name,"DataQuality":100.0 if fstatus=="FULL" else 90.0 if fstatus=="PARTIAL" else 80.0,**stp,"Event hits":hits}
     return result, d, fundamentals(sym), ann
 
 def risk_size(cap,riskpct,entry,stop,maxpos):
@@ -1221,22 +1305,22 @@ def backtest(sym,initial,riskpct,maxpos,fee_bps,slip_bps):
         r=d.iloc[i]
         if pos:
             exit_px=None;reason=None
-            if r.Low<=pos["stop"]: exit_px=pos["stop"];reason="STOP"
-            elif r.High>=pos["target"]: exit_px=pos["target"];reason="TARGET"
-            elif r.Close<r.SMA50: exit_px=float(r.Close);reason="TREND EXIT"
+            if r["Low"]<=pos["stop"]: exit_px=pos["stop"];reason="STOP"
+            elif r["High"]>=pos["target"]: exit_px=pos["target"];reason="TARGET"
+            elif r["Close"]<r["SMA50"]: exit_px=float(r["Close"]);reason="TREND EXIT"
             if exit_px is not None:
                 gross=(exit_px-pos["entry"])*pos["shares"];turn=exit_px*pos["shares"]+pos["entry"]*pos["shares"];all_cost=costs(turn,fee_bps+slip_bps);cash+=exit_px*pos["shares"]-all_cost
                 trades.append([pos["date"],d.index[i],pos["entry"],exit_px,pos["shares"],gross-all_cost,reason]);pos=None
-        if pos is None and r.Close>r.BREAKOUT20 and r.Close>r.SMA50>r.SMA200 and r.VOL_RATIO>=1.5:
-            en=float(d.iloc[i+1].Open)
+        if pos is None and r["Close"]>r["BREAKOUT20"] and r["Close"]>r["SMA50"]>r["SMA200"] and r["VOL_RATIO"]>=1.5:
+            en=float(d.iloc[i+1]["Open"])
             try:
                 stp=derive_stop_target(d.iloc[:i+1], entry=en); stop=stp["Stop"]; target=stp["Target"]
             except Exception:
-                stop=en-2*float(r.ATR); target=en+DEFAULT_R_MULTIPLE*(en-stop)
+                stop=en-2*float(r["ATR"]); target=en+DEFAULT_R_MULTIPLE*(en-stop)
             sh=int((cash*riskpct/100)/(en-stop));sh=min(sh,int(cash*maxpos/100/en)) if en else 0
             if sh:
                 cost=en*sh;cash-=cost+costs(cost,fee_bps+slip_bps);pos={"date":d.index[i+1],"entry":en,"stop":stop,"target":target,"shares":sh}
-        equity.append([d.index[i],cash+(pos["shares"]*r.Close if pos else 0)])
+        equity.append([d.index[i],cash+(pos["shares"]*r["Close"] if pos else 0)])
     eq=pd.DataFrame(equity,columns=["Date","Equity"]).set_index("Date")
     tr=pd.DataFrame(trades,columns=["Entry","Exit","EntryPrice","ExitPrice","Shares","PnL","Reason"])
     return eq,tr
@@ -1271,11 +1355,11 @@ if tab=="🏠 Dashboard":
     rg,ico,bx=market_regime()
     c1,c2,c3=st.columns(3)
     if bx is not None:
-        c1.metric("NIFTY 50",f"{bx.Close:,.0f}"); c3.metric("Benchmark data",str(benchmark_data().index[-1].date()))
+        c1.metric("NIFTY 50",f"{bx["Close"]:,.0f}"); c3.metric("Benchmark data",str(benchmark_data().index[-1].date()))
     else:
         c1.metric("NIFTY 50","Unavailable"); c3.metric("Benchmark data","Unavailable")
     c2.metric("Regime",f"{ico} {rg}")
-    st.info("V5.2.3 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
+    st.info("V5.2.5 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
     st.subheader("🚀 One-tap NSE scan")
     st.write("Scan the full available Nifty 500 universe, rank the best 20 candidates, then select a diversified Top 6 priority list.")
     if st.button("🚀 Scan NSE → Top 20 + Top 6",key="dashscan"):
@@ -1381,8 +1465,8 @@ elif tab=="🔍 Stock":
     if "stock_analysis" in st.session_state:
         r,d,f,ann=st.session_state["stock_analysis"]
         a,b,c,d1=st.columns(4); a.metric("Score",r["Score"]); b.metric("Entry quality",r["Entry Quality"]); c.metric("RSI",r["RSI"]); d1.metric("Signal",r["Signal"] if "Signal" in r else ("PRIORITY" if r["Score"]>=75 else "WATCH"))
-        fig=go.Figure(); fig.add_trace(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name="Price"));
-        dd=daily_features(d); fig.add_trace(go.Scatter(x=dd.index,y=dd.SMA50,name="SMA50")); fig.add_trace(go.Scatter(x=dd.index,y=dd.SMA200,name="SMA200")); fig.update_layout(height=420,xaxis_rangeslider_visible=False,margin=dict(l=5,r=5,t=5,b=5)); st.plotly_chart(fig,use_container_width=True)
+        fig=go.Figure(); fig.add_trace(go.Candlestick(x=d.index,open=d["Open"],high=d["High"],low=d["Low"],close=d["Close"],name="Price"));
+        dd=daily_features(d); fig.add_trace(go.Scatter(x=dd.index,y=dd["SMA50"],name="SMA50")); fig.add_trace(go.Scatter(x=dd.index,y=dd["SMA200"],name="SMA200")); fig.update_layout(height=420,xaxis_rangeslider_visible=False,margin=dict(l=5,r=5,t=5,b=5)); st.plotly_chart(fig,use_container_width=True)
         st.subheader("Decision sheet"); st.json(r)
         st.subheader("Fundamentals")
         try:
@@ -1423,7 +1507,7 @@ elif tab=="📝 Journal":
     st.subheader("Trade journal")
     cols=["Date","Symbol","Setup","Entry","Stop","Target","Shares","Risk₹","Result","R","Notes"]
     if "journal" not in st.session_state: st.session_state.journal=pd.DataFrame(columns=cols)
-    with st.form("journal"):
+    with st.form("trade_journal_form_v525"):
         sym=st.text_input("Symbol"); setup=st.selectbox("Setup",["Breakout","Retest","Trend continuation","Pullback","Other"]); a,b=st.columns(2); en=a.number_input("Entry ₹",0.); sp=b.number_input("Stop ₹",0.); a,b=st.columns(2); tg=a.number_input("Target ₹",0.); sh=b.number_input("Shares",0,1000000,0); res=st.selectbox("Result",["OPEN","WIN","LOSS","BREAKEVEN"]); notes=st.text_area("Notes"); ok=st.form_submit_button("Add")
     if ok and sym:
         risk=abs(en-sp)*sh; pnl=(tg-en)*sh if res=="WIN" else -risk if res=="LOSS" else 0
