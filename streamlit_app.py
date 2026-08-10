@@ -2,6 +2,8 @@ import io
 import json
 import math
 import re
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -22,7 +24,7 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.6"
+APP_VERSION = "V5.2.7"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
@@ -244,6 +246,17 @@ YESBANK
 ZYDUSLIFE
 """.splitlines()
 BUNDLED_SYMBOLS = sorted(set(s.strip().upper() + ".NS" for s in BUNDLED_SYMBOLS if s.strip()))
+
+# User-provided filtered positional watchlist (32 NSE symbols from the uploaded screenshots).
+# This is an additional scan universe only; it does not alter the Nifty 200 universe or scoring formulas.
+FILTERED_STOCKS = [
+    "LGEINDIA", "COALINDIA", "COROMANDEL", "TATAPOWER", "KPRMILL", "EICHERMOT",
+    "TVSMOTOR", "DIXON", "SOLARINDS", "CDSL", "HAL", "CUMMINSIND", "M&M", "VBL",
+    "KEI", "PERSISTENT", "OBEROIRLTY", "APLAPOLLO", "MAZDOCK", "POLYMED",
+    "SBIN", "BPCL", "UNOMINDA", "LT", "ICICIBANK", "BEL", "BAJAJ-AUTO", "MARUTI",
+    "BAJFINANCE", "POLYCAB", "CHOLAFIN", "COFORGE",
+]
+FILTERED_STOCKS = [nse_symbol(x) for x in FILTERED_STOCKS]
 
 SECTOR_MAP = {
     "RELIANCE":"Energy","ONGC":"Energy","OIL":"Energy","COALINDIA":"Energy","BPCL":"Energy","IOC":"Energy","GAIL":"Energy","PETRONET":"Energy","ATGL":"Energy","MGL":"Energy","IGL":"Energy","MRPL":"Energy","GUJGASLTD":"Energy",
@@ -564,6 +577,64 @@ def score_volume(r):
     pts += 5 if breakout else 2 if r["Close"] >= 0.98*r["BREAKOUT20"] else 0
     pts += 5 if breakout and r["VOL_RATIO"] >= 1.5 else 3 if r["VOL_RATIO"] >= 1.2 else 0
     return min(15, pts), breakout
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_brokerage_updates(symbol, limit=10):
+    """Fetch recent brokerage/rating/target-price headlines via Google News RSS.
+
+    This is an information layer only. It never changes the V5.2.6 score, ranking,
+    stop, target, eligibility, or any existing trading logic. If the news provider
+    is unavailable, the stock analysis continues normally.
+    """
+    clean = symbol_clean(symbol)
+    queries = [
+        f'"{clean}" brokerage upgrade downgrade target price',
+        f'"{clean}" analyst rating target price',
+    ]
+    rows, seen = [], set()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    keywords = ("broker", "brokerage", "upgrade", "downgrade", "target price", "target", "buy", "sell", "neutral", "overweight", "underweight", "rating")
+    try:
+        for query in queries:
+            url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+            resp = requests.get(url, headers=headers, timeout=12)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub = (item.findtext("pubDate") or "").strip()
+                source_el = item.find("source")
+                source = (source_el.text or "").strip() if source_el is not None else "Google News"
+                low = title.lower()
+                if not any(k in low for k in keywords):
+                    continue
+                key = link or title
+                if key in seen:
+                    continue
+                seen.add(key)
+                if "upgrade" in low:
+                    typ = "Upgrade"
+                elif "downgrade" in low:
+                    typ = "Downgrade"
+                elif "target price" in low or "target" in low:
+                    typ = "Target price"
+                elif any(k in low for k in ("buy", "sell", "neutral", "overweight", "underweight", "rating")):
+                    typ = "Rating"
+                else:
+                    typ = "Brokerage"
+                rows.append({"Date": pub, "Type": typ, "Headline": title, "Source": source, "Link": link})
+    except Exception as e:
+        return pd.DataFrame(columns=["Date", "Type", "Headline", "Source", "Link"]), f"News provider unavailable: {type(e).__name__}"
+    out = pd.DataFrame(rows, columns=["Date", "Type", "Headline", "Source", "Link"])
+    if out.empty:
+        return out, "No recent brokerage/upgrade/downgrade headlines found."
+    try:
+        out["_dt"] = pd.to_datetime(out["Date"], errors="coerce", utc=True)
+        out = out.sort_values("_dt", ascending=False).drop(columns=["_dt"]).head(limit)
+    except Exception:
+        out = out.head(limit)
+    return out.reset_index(drop=True), "OK"
 
 def fundamentals(symbol):
     try:
@@ -1131,7 +1202,7 @@ elif tab=="🏆 Top 20/Top 6":
 elif tab=="🔎 Scanner":
     u=universe(); source=load_universe()[1]
     st.caption(f"Universe: {len(u)} symbols • source: {source}. Critical price-data failure can exclude a symbol; missing fundamentals/news/weekly data do not automatically exclude it.")
-    mode=st.radio("Mode",["🏆 Automatic Top 20 + Top 6","🎯 Custom selection"],horizontal=True)
+    mode=st.radio("Mode",["🏆 Automatic Top 20 + Top 6","🎯 My 32 → Top 10","🎯 Custom selection"],horizontal=True)
     if mode.startswith("🏆"):
         if st.button("🚀 Run corrected NSE scan",key="scannerfresh"):
             with st.spinner("Downloading and ranking the NSE universe…"):
@@ -1144,6 +1215,28 @@ elif tab=="🔎 Scanner":
             else:
                 cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]
                 st.dataframe(top20[[c for c in cols20 if c in top20.columns]],use_container_width=True,hide_index=True)
+    elif mode.startswith("🎯 My 32"):
+        st.caption(f"Your filtered watchlist: {len(FILTERED_STOCKS)} stocks • same V5.2.6 scoring/eligibility logic • no formula changes.")
+        if st.button("🚀 Scan my 32 → Top 10",key="filtered32scan"):
+            with st.spinner("Downloading and ranking your 32 filtered stocks…"):
+                try:
+                    base, failures = download_prices_batch(FILTERED_STOCKS)
+                    top10, health, ranked = build_ranked_candidates(base, limit=10, enrich_n=32)
+                    health = dict(health or {})
+                    health.update({"Filtered watchlist": len(FILTERED_STOCKS), "Download failures": len(failures), "Failed symbols sample": ", ".join(symbol_clean(x) for x in failures[:12]), "Status": "OK" if not top10.empty else "NO_RANKABLE_CANDIDATES"})
+                    st.session_state["filtered_scan"] = (top10, health, ranked)
+                except Exception as e:
+                    st.session_state["filtered_scan"] = (pd.DataFrame(), {"Filtered watchlist": len(FILTERED_STOCKS), "Status": "SCAN_ERROR", "Error": f"{type(e).__name__}: {e}"}, pd.DataFrame())
+        if "filtered_scan" in st.session_state:
+            top10, health, ranked = st.session_state["filtered_scan"]
+            st.write("### 🎯 My 32 → Top 10")
+            st.json(health)
+            if top10.empty:
+                st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
+            else:
+                cols=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target","StopMethod"]
+                st.dataframe(top10[[c for c in cols if c in top10.columns]],use_container_width=True,hide_index=True)
+                st.download_button("⬇️ Export My Top 10",top10.to_csv(index=False),"my32_top10.csv","text/csv",key="my32top10csv")
     else:
         sel=st.multiselect("Select stocks",u,default=u[:10])
         if st.button("🚀 Run custom scanner",key="custom"):
@@ -1179,6 +1272,21 @@ elif tab=="🔍 Stock":
         st.subheader("Recent announcement sample")
         st.dataframe(ann, use_container_width=True, hide_index=True)
         st.caption("Verify material announcements against the original NSE/company disclosure before acting.")
+
+        st.subheader("🏦 Latest brokerage reports / upgrades & downgrades")
+        st.caption("Information-only feed. Brokerage headlines do not modify the V5.2.6 score, entry, stop, target, or ranking.")
+        broker_df, broker_status = fetch_brokerage_updates(sym, limit=10)
+        if broker_status != "OK":
+            st.info(broker_status)
+        elif broker_df.empty:
+            st.info("No recent brokerage/upgrade/downgrade headlines found.")
+        else:
+            st.dataframe(broker_df.drop(columns=["Link"]), use_container_width=True, hide_index=True)
+            for _, item in broker_df.iterrows():
+                link = item.get("Link", "")
+                if isinstance(link, str) and link:
+                    st.markdown(f"- **{item.get('Type','Brokerage')}** — [{item.get('Headline','Open report')}]({link})")
+            st.caption("Headlines are aggregated from public news results; confirm the original broker note and date before using it in a decision.")
 
 elif tab=="📊 Backtest":
     sym=st.selectbox("Stock",universe()); initial=st.number_input("Initial capital ₹",100000.,100000000.,1000000.,100000.); rp=st.number_input("Risk/trade %",.1,3.,.75,.05); mp=st.number_input("Max position %",5.,50.,20.,1.); fee=st.number_input("Fees/taxes bps",0.,100.,10.,1.); slip=st.number_input("Slippage bps",0.,100.,5.,1.)

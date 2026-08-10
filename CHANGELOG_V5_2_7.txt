@@ -1,0 +1,30 @@
+V5.2.7 — User Filtered Top 10 + Brokerage Updates
+
+PRESERVED
+- Nifty 200 universe and fallback
+- Existing score formulas and weights
+- Price/liquidity eligibility rules
+- Top 20 and Top 6 logic
+- Stop/target formulas
+- Single-stock technical/fundamental calculations
+- Backtest, portfolio, journal and AI prompt logic
+
+NEW FEATURE 1 — MY 32 → TOP 10
+- Adds the 32 stocks supplied in the user's uploaded watchlist screenshots.
+- Scanner mode now offers “🎯 My 32 → Top 10”.
+- Uses the exact existing download, eligibility, scoring, enrichment and stop/target pipeline.
+- Does not alter the Nifty 200 scan.
+- Failed data downloads are reported in scan health and do not crash the app.
+
+NEW FEATURE 2 — BROKERAGE / UPGRADES & DOWNGRADES
+- Single-stock analysis now fetches recent public news headlines matching brokerage,
+  analyst rating, upgrade/downgrade and target-price terms.
+- Uses Google News RSS; 30-minute cache.
+- News feed is information-only and never modifies score, entry, stop, target or ranking.
+- If the provider is unavailable, the stock analysis continues and displays a safe message.
+
+VALIDATION
+- Python compilation passed.
+- Exact AST comparison confirmed core trading/scoring functions are unchanged from V5.2.6.
+- 32 filtered symbols verified unique.
+- Brokerage RSS parser smoke test passed with upgrade/downgrade fixture data.

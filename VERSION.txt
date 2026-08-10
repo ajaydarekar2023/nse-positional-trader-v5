@@ -1,2 +1,6 @@
-V5.2.6
-Nifty 200 universe migration only; V5.2.5 scoring, risk, analysis, journal, AI and scanner logic retained.
+V5.2.7
+
+New features only; existing V5.2.6 scoring/risk/trading logic unchanged.
+1) Added user-provided 32-stock filtered watchlist scan with Top 10 ranking.
+2) Added latest brokerage / upgrade / downgrade / target-price headline section on single-stock analysis.
+3) No new Python dependency; brokerage headlines use public Google News RSS and fail safely if unavailable.

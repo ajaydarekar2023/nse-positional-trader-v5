@@ -46,3 +46,8 @@ After deployment, open the app and use **Refresh all cached data**, then test:
 
 ## Important
 This is a research/paper-trading tool, not an automated trading system. Verify important corporate announcements with the original NSE/company disclosure. Historical backtests are not guarantees of future performance.
+
+## V5.2.7 additions
+- Scanner → **My 32 → Top 10** scans the user's 32-stock filtered watchlist using the same V5.2.6 ranking and risk logic.
+- Stock analysis → **Latest brokerage reports / upgrades & downgrades** fetches recent public brokerage/analyst headlines via Google News RSS.
+- These additions do not alter existing scoring, eligibility, stop/target, Top 20/Top 6, backtest, portfolio, journal or AI logic.
