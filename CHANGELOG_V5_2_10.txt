@@ -1,0 +1,5 @@
+V5.2.10 - shortlist deep links
+- Added Analyze links to Top 20, Top 6, and My 32 → Top 10 tables.
+- Links route to the existing individual Stock analysis section for the selected NSE symbol.
+- Deep-linked stock analysis auto-loads once; existing Analyze button remains available.
+- No scoring, ranking, eligibility, risk, stop, target, journal, AI, or backtest formula changes.

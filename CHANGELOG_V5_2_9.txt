@@ -1,0 +1,8 @@
+V5.2.9 - Brokerage Updates hardening
+- Added isolated brokerage information layer with source priority:
+  Zee Business -> CNBC-TV18 -> secondary financial sources.
+- Added 30-day preferred / 90-day extended recency handling.
+- Added upgrade/downgrade/rating/target classification and informational summary.
+- Brokerage data never modifies existing score, eligibility, ranking, entry, stop, target, Top 20, Top 6, journal, AI, scanner, or backtest logic.
+- Source failures are isolated and do not break stock analysis.
+- No new Python dependency.

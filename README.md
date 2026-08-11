@@ -1,9 +1,9 @@
-# NSE Positional Trader V5.2.6 — Stability + Regression Fix
+# NSE Positional Trader V5.2.9 — Stability + Regression Fix
 
 Phone-first Streamlit research, screening, paper-trading, risk and journaling tool for NSE equities.
 
-## V5.2.6 changes
-- Retained all V5.2.6 single-stock/AI/custom-scanner `'dict' object has no attribute 'Close'` regression by removing pandas attribute-style OHLC/indicator access from the analysis pipeline and using explicit column keys.
+## V5.2.9 changes
+- Retained all V5.2.9 single-stock/AI/custom-scanner `'dict' object has no attribute 'Close'` regression by removing pandas attribute-style OHLC/indicator access from the analysis pipeline and using explicit column keys.
 - Retained defensive column access to benchmark, scoring, stop/target, chart and backtest paths.
 - Retained the Trade Journal fix `StreamlitValueAssignmentNotAllowedError` caused by using the same key for `st.form()` and `st.session_state['journal']`. The form now has a unique widget key.
 - Retained robust OHLCV normalization for yfinance DataFrame/MultiIndex/Series/dict-like responses.
@@ -48,6 +48,15 @@ After deployment, open the app and use **Refresh all cached data**, then test:
 This is a research/paper-trading tool, not an automated trading system. Verify important corporate announcements with the original NSE/company disclosure. Historical backtests are not guarantees of future performance.
 
 ## V5.2.7 additions
-- Scanner → **My 32 → Top 10** scans the user's 32-stock filtered watchlist using the same V5.2.6 ranking and risk logic.
+- Scanner → **My 32 → Top 10** scans the user's 32-stock filtered watchlist using the same V5.2.9 ranking and risk logic.
 - Stock analysis → **Latest brokerage reports / upgrades & downgrades** fetches recent public brokerage/analyst headlines via Google News RSS.
 - These additions do not alter existing scoring, eligibility, stop/target, Top 20/Top 6, backtest, portfolio, journal or AI logic.
+
+
+## V5.2.9 Brokerage Updates
+- Information-only brokerage coverage section.
+- Source priority: Zee Business, CNBC-TV18, then reputable secondary financial sources.
+- 30-day preferred window, 90-day extended window.
+- Upgrade/downgrade/rating/target classification.
+- Source failures never affect trading calculations or break stock analysis.
+- Brokerage information does not modify score, ranking, eligibility, entry, stop, target, Top 20 or Top 6.

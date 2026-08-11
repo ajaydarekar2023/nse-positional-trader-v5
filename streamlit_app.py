@@ -581,60 +581,129 @@ def score_volume(r):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_brokerage_updates(symbol, limit=10):
-    """Fetch recent brokerage/rating/target-price headlines via Google News RSS.
+    """Information-only brokerage/news layer.
 
-    This is an information layer only. It never changes the V5.2.6 score, ranking,
-    stop, target, eligibility, or any existing trading logic. If the news provider
-    is unavailable, the stock analysis continues normally.
+    Source priority:
+      1) Zee Business via Google News RSS domain-restricted search
+      2) CNBC-TV18 via Google News RSS domain-restricted search
+      3) Other reputable financial sources via Google News RSS fallback
+    The function never changes score, ranking, eligibility, entry, stop or target.
+    Failures are isolated so stock analysis continues normally.
     """
     clean = symbol_clean(symbol)
+    # Use both symbol and a human-readable company query where available.
     queries = [
         f'"{clean}" brokerage upgrade downgrade target price',
         f'"{clean}" analyst rating target price',
     ]
+    # Source priority is explicit and reflected in the returned Priority field.
+    source_groups = [
+        ("Zee Business", "zeebiz.com", 1),
+        ("CNBC-TV18", "cnbctv18.com", 2),
+        ("Secondary financial sources", "moneycontrol.com;economictimes.indiatimes.com;business-standard.com;financialexpress.com;reuters.com", 3),
+    ]
+    cols = ["Date", "Type", "Headline", "Source", "Priority", "AgeDays", "Link"]
     rows, seen = [], set()
-    headers = {"User-Agent": "Mozilla/5.0"}
-    keywords = ("broker", "brokerage", "upgrade", "downgrade", "target price", "target", "buy", "sell", "neutral", "overweight", "underweight", "rating")
-    try:
-        for query in queries:
-            url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+
+    def classify(title):
+        low = title.lower()
+        if "upgrade" in low:
+            return "Upgrade"
+        if "downgrade" in low:
+            return "Downgrade"
+        if "target price" in low or "target" in low:
+            return "Target price"
+        if any(k in low for k in ("buy", "sell", "neutral", "overweight", "underweight", "rating")):
+            return "Rating"
+        return "Brokerage"
+
+    def add_feed(url, fallback_source, priority):
+        try:
             resp = requests.get(url, headers=headers, timeout=12)
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
-            for item in root.findall(".//item"):
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                pub = (item.findtext("pubDate") or "").strip()
-                source_el = item.find("source")
-                source = (source_el.text or "").strip() if source_el is not None else "Google News"
-                low = title.lower()
-                if not any(k in low for k in keywords):
-                    continue
-                key = link or title
-                if key in seen:
-                    continue
-                seen.add(key)
-                if "upgrade" in low:
-                    typ = "Upgrade"
-                elif "downgrade" in low:
-                    typ = "Downgrade"
-                elif "target price" in low or "target" in low:
-                    typ = "Target price"
-                elif any(k in low for k in ("buy", "sell", "neutral", "overweight", "underweight", "rating")):
-                    typ = "Rating"
-                else:
-                    typ = "Brokerage"
-                rows.append({"Date": pub, "Type": typ, "Headline": title, "Source": source, "Link": link})
-    except Exception as e:
-        return pd.DataFrame(columns=["Date", "Type", "Headline", "Source", "Link"]), f"News provider unavailable: {type(e).__name__}"
-    out = pd.DataFrame(rows, columns=["Date", "Type", "Headline", "Source", "Link"])
+        except Exception:
+            return 0
+        added = 0
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            source_el = item.find("source")
+            source = (source_el.text or "").strip() if source_el is not None else fallback_source
+            # For domain-restricted feeds, normalize the displayed source to the requested publisher.
+            if priority == 1:
+                source = "Zee Business"
+            elif priority == 2:
+                source = "CNBC-TV18"
+            low = title.lower()
+            keywords = ("broker", "brokerage", "upgrade", "downgrade", "target price",
+                        "target", "buy", "sell", "neutral", "overweight",
+                        "underweight", "rating", "initiated")
+            if not any(k in low for k in keywords):
+                continue
+            key = link or title
+            if key in seen:
+                continue
+            seen.add(key)
+            dt = pd.to_datetime(pub, errors="coerce", utc=True)
+            age = None
+            if pd.notna(dt):
+                try:
+                    age = max(0, int((pd.Timestamp.now(tz="UTC") - dt).total_seconds() // 86400))
+                except Exception:
+                    age = None
+            rows.append({
+                "Date": pub,
+                "Type": classify(title),
+                "Headline": title,
+                "Source": source,
+                "Priority": priority,
+                "AgeDays": age,
+                "Link": link,
+            })
+            added += 1
+        return added
+
+    errors = []
+    # Run source groups in strict priority order. We don't stop after one source:
+    # recent items from all available primary sources are useful, while priority
+    # determines ordering when dates are similar.
+    for label, domains, priority in source_groups:
+        group_added = 0
+        for query in queries:
+            q = f"{query} site:{domains.split(';')[0]}" if ";" not in domains else query
+            if ";" in domains:
+                q = f"{query} ({' OR '.join('site:'+d for d in domains.split(';'))})"
+            try:
+                url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+                group_added += add_feed(url, label, priority)
+            except Exception as e:
+                errors.append(f"{label}: {type(e).__name__}")
+        # If primary source is unavailable, continue to the next source by design.
+
+    out = pd.DataFrame(rows, columns=cols)
     if out.empty:
-        return out, "No recent brokerage/upgrade/downgrade headlines found."
+        msg = "No recent brokerage/upgrade/downgrade coverage found."
+        if errors:
+            msg += " Sources may be temporarily unavailable."
+        return out, msg
+
     try:
         out["_dt"] = pd.to_datetime(out["Date"], errors="coerce", utc=True)
-        out = out.sort_values("_dt", ascending=False).drop(columns=["_dt"]).head(limit)
+        # 90-day extended window. Fresh 30-day reports naturally appear first.
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
+        recent = out[(out["_dt"].isna()) | (out["_dt"] >= cutoff)].copy()
+        out = recent.sort_values(["_dt", "Priority"], ascending=[False, True], na_position="last")
+        # Prefer 30-day coverage, then older 31-90 day coverage.
+        out["_fresh"] = out["_dt"].isna() | (out["_dt"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30))
+        out = out.sort_values(["_fresh", "_dt", "Priority"], ascending=[False, False, True], na_position="last")
+        out = out.drop(columns=["_dt", "_fresh"]).head(limit)
     except Exception:
         out = out.head(limit)
+
+    # Compact source labels for the UI; retain original links.
     return out.reset_index(drop=True), "OK"
 
 def fundamentals(symbol):
@@ -1122,7 +1191,16 @@ st.caption("Stability release • Top 20 → Top 6 • robust data handling • 
 if st.button("🔄 Refresh all cached data"):
     st.cache_data.clear(); st.session_state.pop("scan",None); st.rerun()
 
-tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],default="🏠 Dashboard")
+# Optional deep-link into individual stock analysis from shortlist tables.
+_stock_q = st.query_params.get("stock", "")
+_stock_q = symbol_clean(_stock_q) if _stock_q else ""
+_stock_deeplink = bool(_stock_q and _stock_q in {symbol_clean(x) for x in universe()})
+_default_section = "🔍 Stock" if _stock_deeplink else "🏠 Dashboard"
+tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],default=_default_section)
+
+def _analysis_link(symbol):
+    s = symbol_clean(symbol)
+    return f"?stock={quote_plus(s)}"
 
 if tab=="🏠 Dashboard":
     rg,ico,bx=market_regime()
@@ -1132,7 +1210,7 @@ if tab=="🏠 Dashboard":
     else:
         c1.metric("NIFTY 50","Unavailable"); c3.metric("Benchmark data","Unavailable")
     c2.metric("Regime",f"{ico} {rg}")
-    st.info("V5.2.6 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
+    st.info("V5.2.10 uses free public/provider data by default. It is research/paper-trading software, not a licensed real-time NSE feed and not a live broker execution system.")
     st.subheader("🚀 One-tap NSE scan")
     st.write("Scan the full available Nifty 200 universe, rank the best 20 candidates, then select a diversified Top 6 priority list.")
     if st.button("🚀 Scan NSE → Top 20 + Top 6",key="dashscan"):
@@ -1154,7 +1232,10 @@ if tab=="🏠 Dashboard":
         if top20.empty:
             st.warning(f"No candidates could be ranked. Status: {health.get('Status','UNKNOWN')}. {health.get('Error','Check Scan Health and data availability.')}")
         else:
-            st.dataframe(top20[[c for c in display if c in top20.columns]],use_container_width=True,hide_index=True)
+            _show = top20[[c for c in display if c in top20.columns]].copy()
+            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
             st.download_button("⬇️ Export Top 20",top20.to_csv(index=False),"v5_2_top20.csv","text/csv",key="top20csv")
         st.subheader("🎯 Top 6 priority setups")
         st.caption("Priority = 60% V5 score + 25% entry quality + 15% regime/portfolio fit, with a soft sector concentration cap of two names per sector.")
@@ -1162,7 +1243,10 @@ if tab=="🏠 Dashboard":
         if top6.empty:
             st.info("Top 6 is unavailable until at least one candidate is rankable.")
         else:
-            st.dataframe(top6[[c for c in display6 if c in top6.columns]],use_container_width=True,hide_index=True)
+            _show = top6[[c for c in display6 if c in top6.columns]].copy()
+            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
             st.download_button("⬇️ Export Top 6",top6.to_csv(index=False),"v5_2_top6.csv","text/csv",key="top6csv")
         st.subheader("🔔 Alerts")
         alerts=build_alerts(top20)
@@ -1185,13 +1269,19 @@ elif tab=="🏆 Top 20/Top 6":
             st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
         else:
             cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality"]
-            st.dataframe(top20[[c for c in cols20 if c in top20.columns]],use_container_width=True,hide_index=True)
+            _show = top20[[c for c in cols20 if c in top20.columns]].copy()
+            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
         st.write("### Top 6 priority list")
         if top6.empty:
             st.info("No Top 6 candidates available.")
         else:
             cols6=["Priority Rank","Symbol","Sector","PriorityScore","Score","Entry Quality","PriorityFit","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","EventPenalty"]
-            st.dataframe(top6[[c for c in cols6 if c in top6.columns]],use_container_width=True,hide_index=True)
+            _show = top6[[c for c in cols6 if c in top6.columns]].copy()
+            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
             st.write("### Why the candidates ranked")
             for _,r in top6.iterrows():
                 st.write(f"**{int(r['Priority Rank'])}. {r['Symbol']}** — {r['Why']}")
@@ -1215,7 +1305,10 @@ elif tab=="🔎 Scanner":
                 st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
             else:
                 cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]
-                st.dataframe(top20[[c for c in cols20 if c in top20.columns]],use_container_width=True,hide_index=True)
+                _show = top20[[c for c in cols20 if c in top20.columns]].copy()
+            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
     elif mode.startswith("🎯 My 32"):
         st.caption(f"Your filtered watchlist: {len(FILTERED_STOCKS)} stocks • same V5.2.6 scoring/eligibility logic • no formula changes.")
         if st.button("🚀 Scan my 32 → Top 10",key="filtered32scan"):
@@ -1236,7 +1329,10 @@ elif tab=="🔎 Scanner":
                 st.warning(f"No candidates could be ranked. {health.get('Error','Review Scan Health.')}")
             else:
                 cols=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target","StopMethod"]
-                st.dataframe(top10[[c for c in cols if c in top10.columns]],use_container_width=True,hide_index=True)
+                _show = top10[[c for c in cols if c in top10.columns]].copy()
+                _show["Analyze"] = _show["Symbol"].map(_analysis_link)
+                st.dataframe(_show, use_container_width=True, hide_index=True,
+                             column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
                 st.download_button("⬇️ Export My Top 10",top10.to_csv(index=False),"my32_top10.csv","text/csv",key="my32top10csv")
     else:
         sel=st.multiselect("Select stocks",u,default=u[:10])
@@ -1251,11 +1347,18 @@ elif tab=="🔎 Scanner":
             if rows: st.dataframe(pd.DataFrame(rows).sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
 
 elif tab=="🔍 Stock":
-    sym=st.selectbox("NSE stock",universe())
+    _u = universe()
+    _default_idx = _u.index(_stock_q) if _stock_deeplink and _stock_q in _u else 0
+    sym=st.selectbox("NSE stock",_u,index=_default_idx)
     st.caption(f"Eligibility: close ≤ ₹{MAX_STOCK_PRICE:,.0f} and liquid (20D avg traded value ≥ ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr, median ≥ ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr, active volume days ≥ {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%).")
-    if st.button("Analyze stock",key="anstock"):
+    _auto_key = f"deep_analyzed_{sym}"
+    _should_auto = _stock_deeplink and _stock_q == symbol_clean(sym) and not st.session_state.get(_auto_key, False)
+    if st.button("Analyze stock",key="anstock") or _should_auto:
         with st.spinner("Loading stock data…"):
-            try: st.session_state["stock_analysis"]=signal(sym)
+            try:
+                st.session_state["stock_analysis"]=signal(sym)
+                if _should_auto:
+                    st.session_state[_auto_key] = True
             except Exception as e: st.error(str(e))
     if "stock_analysis" in st.session_state:
         r,d,f,ann=st.session_state["stock_analysis"]
@@ -1274,14 +1377,27 @@ elif tab=="🔍 Stock":
         st.dataframe(ann, use_container_width=True, hide_index=True)
         st.caption("Verify material announcements against the original NSE/company disclosure before acting.")
 
-        st.subheader("🏦 Latest brokerage reports / upgrades & downgrades")
-        st.caption("Information-only feed. Brokerage headlines do not modify the V5.2.6 score, entry, stop, target, or ranking.")
+        st.subheader("🏦 Brokerage Updates — Zee Business / CNBC-TV18")
+        st.caption("Information-only feed. Source priority: Zee Business → CNBC-TV18 → secondary financial sources. Brokerage coverage never modifies the V5.2.6 score, entry, stop, target, eligibility, or ranking.")
         broker_df, broker_status = fetch_brokerage_updates(sym, limit=10)
         if broker_status != "OK":
             st.info(broker_status)
         elif broker_df.empty:
             st.info("No recent brokerage/upgrade/downgrade headlines found.")
         else:
+            # Informational summary only; never fed into trading calculations.
+            try:
+                ups = int((broker_df["Type"] == "Upgrade").sum())
+                downs = int((broker_df["Type"] == "Downgrade").sum())
+                targets_up = int(((broker_df["Type"] == "Target price") & broker_df["Headline"].str.lower().str.contains("rais|hike|increase|up", na=False)).sum())
+                targets_down = int(((broker_df["Type"] == "Target price") & broker_df["Headline"].str.lower().str.contains("cut|lower|reduce|down", na=False)).sum())
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Upgrades", ups)
+                c2.metric("Downgrades", downs)
+                c3.metric("Target ↑", targets_up)
+                c4.metric("Target ↓", targets_down)
+            except Exception:
+                pass
             st.dataframe(broker_df.drop(columns=["Link"]), use_container_width=True, hide_index=True)
             for _, item in broker_df.iterrows():
                 link = item.get("Link", "")
