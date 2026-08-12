@@ -1,0 +1,10 @@
+V5.2.14 — Analyze navigation + brokerage visibility fix
+
+- Fixed shortlist Analyze action so it reliably switches the existing Section control to Stock before rerun.
+- The selected shortlist symbol is passed through the existing stock query/deep-link and automatically uses the existing signal()/Analyze stock path.
+- Removed dependency on the obsolete _analysis_link mechanism; no new-tab behavior.
+- Made Brokerage Updates visibly available in the Stock section with an explicit fetch button.
+- Added the simple brokerage table: Date, Brokerage, Action, Target, Source, Window, Report/headline.
+- Last 30 days are prioritized; 31–90 days are fallback context.
+- Brokerage information remains completely isolated from scoring, ranking, eligibility, entry, stop, target, Top 20/Top 6/Top 10 formulas.
+- Python compile, V5.2.6 regression + Nifty 200 smoke test, and brokerage parser smoke test passed.

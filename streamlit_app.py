@@ -1196,12 +1196,23 @@ _stock_q = st.query_params.get("stock", "")
 _stock_q = symbol_clean(_stock_q) if _stock_q else ""
 _section_q = str(st.query_params.get("section", "")).lower()
 _stock_deeplink = bool(_stock_q and _stock_q in {symbol_clean(x) for x in universe()})
+
+# Navigation hand-off used by shortlist Analyze buttons.  We set the widget state
+# on the run BEFORE the segmented_control is created; this avoids Streamlit's
+# widget-state assignment restriction and makes the action reliable on mobile.
+if st.session_state.pop("_pending_stock_nav", False):
+    st.session_state["section_nav"] = "🔍 Stock"
+
 _default_section = "🔍 Stock" if (_stock_deeplink or _section_q == "stock") else "🏠 Dashboard"
-tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],default=_default_section)
+if "section_nav" not in st.session_state:
+    st.session_state["section_nav"] = _default_section
+tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],key="section_nav")
 
 def _open_stock_analysis(symbol, key_prefix):
     s = symbol_clean(symbol)
     if st.button("🔍 Analyze", key=f"{key_prefix}_{s}", use_container_width=True):
+        st.session_state["_pending_stock"] = s
+        st.session_state["_pending_stock_nav"] = True
         st.query_params["stock"] = s
         st.query_params["section"] = "stock"
         st.session_state.pop("stock_analysis", None)
@@ -1242,6 +1253,11 @@ def _render_analysis_table(df, key_prefix):
         st.write("")
         analyze = st.button("🔍 Analyze", key=f"{key_prefix}_analyze", use_container_width=True)
     if analyze:
+        # Store the selection before rerun. On the next run the navigation widget
+        # is initialized to Stock first, then the existing stock-analysis path
+        # automatically runs for this symbol.
+        st.session_state["_pending_stock"] = selected
+        st.session_state["_pending_stock_nav"] = True
         st.query_params["stock"] = selected
         st.query_params["section"] = "stock"
         st.session_state.pop("stock_analysis", None)
@@ -1412,53 +1428,65 @@ elif tab=="🔍 Stock":
         st.dataframe(ann, use_container_width=True, hide_index=True)
         st.caption("Verify material announcements against the original NSE/company disclosure before acting.")
 
-        st.subheader("🏦 Brokerage Updates — Zee Business / CNBC-TV18")
-        st.caption("Information-only feed. Source priority: Zee Business → CNBC-TV18 → secondary financial sources. Brokerage coverage never modifies the V5.2.6 score, entry, stop, target, eligibility, or ranking.")
-        broker_df, broker_status = fetch_brokerage_updates(sym, limit=10)
-        if broker_status != "OK":
-            st.info(broker_status)
-        elif broker_df.empty:
-            st.info("No recent brokerage/upgrade/downgrade headlines found.")
-        else:
-            # Informational summary only; never fed into trading calculations.
-            try:
-                ups = int((broker_df["Type"] == "Upgrade").sum())
-                downs = int((broker_df["Type"] == "Downgrade").sum())
-                targets_up = int(((broker_df["Type"] == "Target price") & broker_df["Headline"].str.lower().str.contains("rais|hike|increase|up", na=False)).sum())
-                targets_down = int(((broker_df["Type"] == "Target price") & broker_df["Headline"].str.lower().str.contains("cut|lower|reduce|down", na=False)).sum())
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Upgrades", ups)
-                c2.metric("Downgrades", downs)
-                c3.metric("Target ↑", targets_up)
-                c4.metric("Target ↓", targets_down)
-            except Exception:
-                pass
-            _b = broker_df.copy()
-            def _broker_firm(h):
-                s=str(h).lower()
-                firms={"morgan stanley":"Morgan Stanley","jefferies":"Jefferies","clsa":"CLSA","jp morgan":"JP Morgan","jpmorgan":"JP Morgan","hsbc":"HSBC","goldman sachs":"Goldman Sachs","nomura":"Nomura","ubs":"UBS","citi":"Citi","macquarie":"Macquarie","bernstein":"Bernstein","emkay":"Emkay","motilal oswal":"Motilal Oswal","prabhudas lilladher":"Prabhudas Lilladher"}
-                return next((v for k,v in firms.items() if k in s),"Other / not stated")
-            def _action(h):
-                s=str(h).lower()
-                if "downgrade" in s: return "Downgrade"
-                if "upgrade" in s: return "Upgrade"
-                if "initiated" in s or "initiate" in s: return "Initiated"
-                if any(x in s for x in ("maintain","reiterate","retains","retained")): return "Maintained"
-                return "Target / Rating"
-            def _target(h):
-                m=re.search(r'(?:target(?: price)?|tp)\s*(?:of|at|to|:)??\s*₹?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',str(h),re.I)
-                return ("₹"+m.group(1)) if m else "—"
-            _b["Brokerage"]=_b["Headline"].map(_broker_firm)
-            _b["Action"]=_b["Headline"].map(_action)
-            _b["Target"]=_b["Headline"].map(_target)
-            _b["Window"]=_b["AgeDays"].apply(lambda x:"Last 30 days" if pd.notna(x) and x<=30 else "31–90 days")
-            _b=_b[["Date","Brokerage","Action","Target","Source","Window","Headline","Link"]]
-            st.dataframe(_b.drop(columns=["Link"]),use_container_width=True,hide_index=True)
-            for _, item in broker_df.iterrows():
-                link = item.get("Link", "")
-                if isinstance(link, str) and link:
-                    st.markdown(f"- **{item.get('Type','Brokerage')}** — [{item.get('Headline','Open report')}]({link})")
-            st.caption("Headlines are aggregated from public news results; confirm the original broker note and date before using it in a decision.")
+        st.subheader("🏦 Brokerage Updates")
+        st.caption("Simple information-only table • Last 30 days prioritized • Zee Business → CNBC-TV18 → secondary financial sources. Brokerage calls never modify scoring, entry, stop, target, eligibility or ranking.")
+
+        # Brokerage reports are deliberately independent of the trading formulas.
+        # They can also be fetched without first running the technical/fundamental analysis.
+        _broker_key = f"brokerage_updates_{symbol_clean(sym)}"
+        _fetch_broker_now = st.button("📰 Fetch latest brokerage updates", key=f"{_broker_key}_button", use_container_width=True)
+        if _fetch_broker_now or st.session_state.get("brokerage_updates_symbol") == symbol_clean(sym) or "stock_analysis" in st.session_state:
+            if _fetch_broker_now or st.session_state.get("brokerage_updates_symbol") != symbol_clean(sym):
+                with st.spinner("Fetching recent brokerage reports…"):
+                    _broker_df, _broker_status = fetch_brokerage_updates(sym, limit=10)
+                st.session_state["brokerage_updates_symbol"] = symbol_clean(sym)
+                st.session_state["brokerage_updates_df"] = _broker_df
+                st.session_state["brokerage_updates_status"] = _broker_status
+            else:
+                _broker_df = st.session_state.get("brokerage_updates_df", pd.DataFrame())
+                _broker_status = st.session_state.get("brokerage_updates_status", "")
+
+            if _broker_status != "OK":
+                st.info(_broker_status or "No recent brokerage/upgrade/downgrade coverage found.")
+            elif _broker_df is None or _broker_df.empty:
+                st.info("No recent brokerage/upgrade/downgrade coverage found for this stock in the available public sources.")
+            else:
+                _b = _broker_df.copy()
+
+                def _broker_firm(h):
+                    text = str(h).lower()
+                    firms = {
+                        "morgan stanley":"Morgan Stanley", "jefferies":"Jefferies", "clsa":"CLSA",
+                        "jp morgan":"JP Morgan", "jpmorgan":"JP Morgan", "hsbc":"HSBC",
+                        "goldman sachs":"Goldman Sachs", "nomura":"Nomura", "ubs":"UBS", "citi":"Citi",
+                        "macquarie":"Macquarie", "bernstein":"Bernstein", "emkay":"Emkay",
+                        "motilal oswal":"Motilal Oswal", "prabhudas lilladher":"Prabhudas Lilladher"
+                    }
+                    return next((v for k, v in firms.items() if k in text), "Other / not stated")
+
+                def _action(h):
+                    text = str(h).lower()
+                    if "downgrade" in text: return "Downgrade"
+                    if "upgrade" in text: return "Upgrade"
+                    if "initiated" in text or "initiate" in text: return "Initiated"
+                    if any(x in text for x in ("maintain", "reiterate", "retains", "retained")): return "Maintained"
+                    return "Target / Rating"
+
+                def _target(h):
+                    # Handles common headline forms such as "target ₹1,850",
+                    # "target price of Rs 1850", and "TP 1850".
+                    m = re.search(r'(?:target(?:\s+price)?|tp)\s*(?:of|at|to|:)??\s*(?:₹|rs\.?|inr\s*)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', str(h), re.I)
+                    return ("₹" + m.group(1)) if m else "—"
+
+                _b["Brokerage"] = _b["Headline"].map(_broker_firm)
+                _b["Action"] = _b["Headline"].map(_action)
+                _b["Target"] = _b["Headline"].map(_target)
+                _b["Window"] = _b["AgeDays"].apply(lambda x: "Last 30 days" if pd.notna(x) and x <= 30 else "31–90 days")
+                _b["Date"] = pd.to_datetime(_b["Date"], errors="coerce", utc=True).dt.strftime("%d-%b-%Y")
+                _display = _b[["Date", "Brokerage", "Action", "Target", "Source", "Window", "Headline"]].copy()
+                _display = _display.rename(columns={"Headline": "Report / headline"})
+                st.dataframe(_display, use_container_width=True, hide_index=True)
+                st.caption("Fresh 0–30 day reports are shown first; 31–90 day items are fallback context. Open the original report before relying on a target or rating.")
 
 elif tab=="📊 Backtest":
     sym=st.selectbox("Stock",universe()); initial=st.number_input("Initial capital ₹",100000.,100000000.,1000000.,100000.); rp=st.number_input("Risk/trade %",.1,3.,.75,.05); mp=st.number_input("Max position %",5.,50.,20.,1.); fee=st.number_input("Fees/taxes bps",0.,100.,10.,1.); slip=st.number_input("Slippage bps",0.,100.,5.,1.)
