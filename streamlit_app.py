@@ -1194,13 +1194,30 @@ if st.button("🔄 Refresh all cached data"):
 # Optional deep-link into individual stock analysis from shortlist tables.
 _stock_q = st.query_params.get("stock", "")
 _stock_q = symbol_clean(_stock_q) if _stock_q else ""
+_section_q = str(st.query_params.get("section", "")).lower()
 _stock_deeplink = bool(_stock_q and _stock_q in {symbol_clean(x) for x in universe()})
-_default_section = "🔍 Stock" if _stock_deeplink else "🏠 Dashboard"
+_default_section = "🔍 Stock" if (_stock_deeplink or _section_q == "stock") else "🏠 Dashboard"
 tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],default=_default_section)
 
-def _analysis_link(symbol):
+def _open_stock_analysis(symbol, key_prefix):
     s = symbol_clean(symbol)
-    return f"?stock={quote_plus(s)}"
+    if st.button("🔍 Analyze", key=f"{key_prefix}_{s}", use_container_width=True):
+        st.query_params["stock"] = s
+        st.query_params["section"] = "stock"
+        st.session_state.pop("stock_analysis", None)
+        st.rerun()
+
+def _render_analysis_table(df, key_prefix):
+    if df is None or df.empty:
+        st.info("No candidates returned.")
+        return
+    head=st.columns([0.55,1.15,0.85,0.9,0.95,0.95,0.95,0.75,1.05])
+    for c,label in zip(head,["#","Stock","Score","Entry Q","Entry","Stop","Target","R:R","Action"]): c.markdown(f"**{label}**")
+    for idx,row in df.reset_index(drop=True).iterrows():
+        vals=[row.get("Rank",idx+1),row.get("Symbol",""),row.get("Score",""),row.get("Entry Quality",""),row.get("Entry",""),row.get("Stop",""),row.get("Target",""),row.get("R:R","")]
+        cols=st.columns([0.55,1.15,0.85,0.9,0.95,0.95,0.95,0.75,1.05])
+        for c,v in zip(cols[:-1],vals): c.write(v)
+        _open_stock_analysis(str(row.get("Symbol","")),f"{key_prefix}_{idx}")
 
 if tab=="🏠 Dashboard":
     rg,ico,bx=market_regime()
@@ -1233,9 +1250,7 @@ if tab=="🏠 Dashboard":
             st.warning(f"No candidates could be ranked. Status: {health.get('Status','UNKNOWN')}. {health.get('Error','Check Scan Health and data availability.')}")
         else:
             _show = top20[[c for c in display if c in top20.columns]].copy()
-            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-            st.dataframe(_show, use_container_width=True, hide_index=True,
-                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+            _render_analysis_table(_show, "dashboard_top20")
             st.download_button("⬇️ Export Top 20",top20.to_csv(index=False),"v5_2_top20.csv","text/csv",key="top20csv")
         st.subheader("🎯 Top 6 priority setups")
         st.caption("Priority = 60% V5 score + 25% entry quality + 15% regime/portfolio fit, with a soft sector concentration cap of two names per sector.")
@@ -1244,9 +1259,7 @@ if tab=="🏠 Dashboard":
             st.info("Top 6 is unavailable until at least one candidate is rankable.")
         else:
             _show = top6[[c for c in display6 if c in top6.columns]].copy()
-            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-            st.dataframe(_show, use_container_width=True, hide_index=True,
-                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+            _render_analysis_table(_show, "top20_tab")
             st.download_button("⬇️ Export Top 6",top6.to_csv(index=False),"v5_2_top6.csv","text/csv",key="top6csv")
         st.subheader("🔔 Alerts")
         alerts=build_alerts(top20)
@@ -1270,18 +1283,14 @@ elif tab=="🏆 Top 20/Top 6":
         else:
             cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality"]
             _show = top20[[c for c in cols20 if c in top20.columns]].copy()
-            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-            st.dataframe(_show, use_container_width=True, hide_index=True,
-                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+            _render_analysis_table(_show, "top6_tab")
         st.write("### Top 6 priority list")
         if top6.empty:
             st.info("No Top 6 candidates available.")
         else:
             cols6=["Priority Rank","Symbol","Sector","PriorityScore","Score","Entry Quality","PriorityFit","Weekly","Daily","RS vs NIFTY","Sector RS","Vol X","Fundamental","EventPenalty"]
             _show = top6[[c for c in cols6 if c in top6.columns]].copy()
-            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-            st.dataframe(_show, use_container_width=True, hide_index=True,
-                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+            _render_analysis_table(_show, "scanner_top20")
             st.write("### Why the candidates ranked")
             for _,r in top6.iterrows():
                 st.write(f"**{int(r['Priority Rank'])}. {r['Symbol']}** — {r['Why']}")
@@ -1306,9 +1315,7 @@ elif tab=="🔎 Scanner":
             else:
                 cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]
                 _show = top20[[c for c in cols20 if c in top20.columns]].copy()
-            _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-            st.dataframe(_show, use_container_width=True, hide_index=True,
-                         column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+            _render_analysis_table(_show, "my32_top10")
     elif mode.startswith("🎯 My 32"):
         st.caption(f"Your filtered watchlist: {len(FILTERED_STOCKS)} stocks • same V5.2.6 scoring/eligibility logic • no formula changes.")
         if st.button("🚀 Scan my 32 → Top 10",key="filtered32scan"):
@@ -1398,7 +1405,27 @@ elif tab=="🔍 Stock":
                 c4.metric("Target ↓", targets_down)
             except Exception:
                 pass
-            st.dataframe(broker_df.drop(columns=["Link"]), use_container_width=True, hide_index=True)
+            _b = broker_df.copy()
+            def _broker_firm(h):
+                s=str(h).lower()
+                firms={"morgan stanley":"Morgan Stanley","jefferies":"Jefferies","clsa":"CLSA","jp morgan":"JP Morgan","jpmorgan":"JP Morgan","hsbc":"HSBC","goldman sachs":"Goldman Sachs","nomura":"Nomura","ubs":"UBS","citi":"Citi","macquarie":"Macquarie","bernstein":"Bernstein","emkay":"Emkay","motilal oswal":"Motilal Oswal","prabhudas lilladher":"Prabhudas Lilladher"}
+                return next((v for k,v in firms.items() if k in s),"Other / not stated")
+            def _action(h):
+                s=str(h).lower()
+                if "downgrade" in s: return "Downgrade"
+                if "upgrade" in s: return "Upgrade"
+                if "initiated" in s or "initiate" in s: return "Initiated"
+                if any(x in s for x in ("maintain","reiterate","retains","retained")): return "Maintained"
+                return "Target / Rating"
+            def _target(h):
+                m=re.search(r'(?:target(?: price)?|tp)\s*(?:of|at|to|:)??\s*₹?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',str(h),re.I)
+                return ("₹"+m.group(1)) if m else "—"
+            _b["Brokerage"]=_b["Headline"].map(_broker_firm)
+            _b["Action"]=_b["Headline"].map(_action)
+            _b["Target"]=_b["Headline"].map(_target)
+            _b["Window"]=_b["AgeDays"].apply(lambda x:"Last 30 days" if pd.notna(x) and x<=30 else "31–90 days")
+            _b=_b[["Date","Brokerage","Action","Target","Source","Window","Headline","Link"]]
+            st.dataframe(_b.drop(columns=["Link"]),use_container_width=True,hide_index=True)
             for _, item in broker_df.iterrows():
                 link = item.get("Link", "")
                 if isinstance(link, str) and link:

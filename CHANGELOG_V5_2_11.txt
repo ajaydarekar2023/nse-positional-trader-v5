@@ -1,0 +1,6 @@
+V5.2.11 - In-app stock analysis navigation + simplified brokerage table
+- Shortlist Analyze buttons now use Streamlit in-app state/navigation and the existing Analyze stock workflow.
+- No new-tab URL action.
+- Brokerage table simplified to Date, Brokerage, Action, Target, Source, Window, Headline.
+- Last 30 days prioritized; 31-90 days retained as fallback.
+- No trading formulas or scoring logic changed.
