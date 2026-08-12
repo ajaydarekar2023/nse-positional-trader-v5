@@ -1208,16 +1208,44 @@ def _open_stock_analysis(symbol, key_prefix):
         st.rerun()
 
 def _render_analysis_table(df, key_prefix):
+    """Render shortlist data as a real responsive table plus a safe in-app Analyze control.
+
+    The previous implementation used Streamlit columns for every cell and then placed a
+    full-width button outside those columns. On narrow/mobile screens Streamlit stacks
+    the columns vertically, making the table look like a long list and separating the
+    Analyze button from its row. Keep the data itself in st.dataframe so it remains a
+    proper table, and use one explicit stock selector + Analyze button below it.
+    """
     if df is None or df.empty:
         st.info("No candidates returned.")
         return
-    head=st.columns([0.55,1.15,0.85,0.9,0.95,0.95,0.95,0.75,1.05])
-    for c,label in zip(head,["#","Stock","Score","Entry Q","Entry","Stop","Target","R:R","Action"]): c.markdown(f"**{label}**")
-    for idx,row in df.reset_index(drop=True).iterrows():
-        vals=[row.get("Rank",idx+1),row.get("Symbol",""),row.get("Score",""),row.get("Entry Quality",""),row.get("Entry",""),row.get("Stop",""),row.get("Target",""),row.get("R:R","")]
-        cols=st.columns([0.55,1.15,0.85,0.9,0.95,0.95,0.95,0.75,1.05])
-        for c,v in zip(cols[:-1],vals): c.write(v)
-        _open_stock_analysis(str(row.get("Symbol","")),f"{key_prefix}_{idx}")
+
+    table = df.reset_index(drop=True).copy()
+    preferred = ["Rank","Symbol","Score","Entry Quality","Entry","Stop","Target","R:R","Signal"]
+    visible = [c for c in preferred if c in table.columns]
+    if not visible:
+        visible = list(table.columns)
+    table = table[visible]
+
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    symbols = [symbol_clean(x) for x in df["Symbol"].dropna().astype(str).tolist()] if "Symbol" in df.columns else []
+    symbols = list(dict.fromkeys(x for x in symbols if x))
+    if not symbols:
+        return
+
+    c1, c2 = st.columns([2.2, 1.0])
+    with c1:
+        selected = st.selectbox("Stock to analyze", symbols, key=f"{key_prefix}_select")
+    with c2:
+        st.write("")
+        st.write("")
+        analyze = st.button("🔍 Analyze", key=f"{key_prefix}_analyze", use_container_width=True)
+    if analyze:
+        st.query_params["stock"] = selected
+        st.query_params["section"] = "stock"
+        st.session_state.pop("stock_analysis", None)
+        st.rerun()
 
 if tab=="🏠 Dashboard":
     rg,ico,bx=market_regime()
@@ -1315,7 +1343,7 @@ elif tab=="🔎 Scanner":
             else:
                 cols20=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target"]
                 _show = top20[[c for c in cols20 if c in top20.columns]].copy()
-            _render_analysis_table(_show, "my32_top10")
+                _render_analysis_table(_show, "scanner_top20")
     elif mode.startswith("🎯 My 32"):
         st.caption(f"Your filtered watchlist: {len(FILTERED_STOCKS)} stocks • same V5.2.6 scoring/eligibility logic • no formula changes.")
         if st.button("🚀 Scan my 32 → Top 10",key="filtered32scan"):
@@ -1337,9 +1365,9 @@ elif tab=="🔎 Scanner":
             else:
                 cols=["Rank","Symbol","Sector","Score","Entry Quality","Weekly","Daily","Trend","Momentum","RS vs NIFTY","Sector RS","Vol X","Fundamental","FundStatus","EventPenalty","DataQuality","Entry","Stop","Target","StopMethod"]
                 _show = top10[[c for c in cols if c in top10.columns]].copy()
-                _show["Analyze"] = _show["Symbol"].map(_analysis_link)
-                st.dataframe(_show, use_container_width=True, hide_index=True,
-                             column_config={"Analyze": st.column_config.LinkColumn("Analyze", display_text="🔍 Open")})
+                # Use the same in-app Analyze action as Top 20/Top 6.
+                # Do not construct a URL or depend on an undefined link helper.
+                _render_analysis_table(_show, "my32_top10")
                 st.download_button("⬇️ Export My Top 10",top10.to_csv(index=False),"my32_top10.csv","text/csv",key="my32top10csv")
     else:
         sel=st.multiselect("Select stocks",u,default=u[:10])

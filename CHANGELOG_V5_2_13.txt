@@ -1,0 +1,7 @@
+V5.2.13 — Mobile/UI stability fix
+
+- Replaced the shortlist cell-by-cell Streamlit columns with a responsive st.dataframe.
+- Added a single explicit Stock to analyze selector + in-app Analyze button below each shortlist.
+- Analyze still uses the existing query-param deep-link into the Stock section and existing signal() path.
+- No scoring, ranking, eligibility, target, stop-loss, or brokerage formulas changed.
+- Fixed automatic Scanner branch so the renderer is not called with an undefined _show when Top 20 is empty.
