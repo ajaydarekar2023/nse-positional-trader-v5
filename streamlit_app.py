@@ -1393,8 +1393,11 @@ elif tab=="🔍 Stock":
     # direct stock query parameter.
     _pending = symbol_clean(st.session_state.pop("_pending_stock", ""))
     _requested = _pending or _stock_q
-    if _requested in _u:
-        st.session_state["stock_selector"] = _requested
+    # Match by cleaned symbol because the universe normally contains Yahoo-style
+    # tickers (e.g. HAL.NS) while shortlist rows use NSE symbols (HAL).
+    _requested_raw = next((x for x in _u if symbol_clean(x) == _requested), None) if _requested else None
+    if _requested_raw is not None:
+        st.session_state["stock_selector"] = _requested_raw
     sym=st.selectbox("NSE stock",_u,key="stock_selector")
     st.caption(f"Eligibility: close ≤ ₹{MAX_STOCK_PRICE:,.0f} and liquid (20D avg traded value ≥ ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr, median ≥ ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr, active volume days ≥ {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%).")
     _auto_key = f"deep_analyzed_{symbol_clean(sym)}"
@@ -1477,9 +1480,11 @@ elif tab=="🔍 Stock":
                 def _target(h):
                     text = re.sub(r'&nbsp;|<[^>]+>', ' ', str(h), flags=re.I)
                     text = re.sub(r'\s+', ' ', text)
+                    # Handle common brokerage-report wording, including cases where
+                    # the currency symbol is omitted (e.g. "CLSA target 1450").
                     patterns = [
-                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
-                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to|raised|cut|revised)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to|raised|cut|revised)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
                     ]
                     for pat in patterns:
                         m = re.search(pat, text, re.I)
@@ -1492,13 +1497,17 @@ elif tab=="🔍 Stock":
                 _b["Target"] = _b["_text"].map(_target)
                 _b["Window"] = _b["AgeDays"].apply(lambda x: "Last 30 days" if pd.notna(x) and x <= 30 else "31–90 days")
                 _b["Date"] = pd.to_datetime(_b["Date"], errors="coerce", utc=True).dt.strftime("%d-%b-%Y")
+                # Keep the simple grid. The Source column itself is a real clickable
+                # URL so the original report can always be opened from the table.
                 _display = _b[["Date", "Brokerage", "Action", "Target", "Source", "Window", "Link", "Headline"]].copy()
-                _display = _display.rename(columns={"Headline": "Report / headline", "Link": "Source link"})
-                # Keep the simple grid, but make the source genuinely clickable.
+                _display = _display.rename(columns={"Headline": "Report / headline", "Link": "Source"})
+                _display["Source"] = _display["Source"].fillna("").astype(str)
+                _display.loc[~_display["Source"].str.startswith(("http://", "https://")), "Source"] = ""
                 try:
-                    cfg = {"Source link": st.column_config.LinkColumn("Source", display_text="Open report", validate="^https?://")}
+                    cfg = {"Source": st.column_config.LinkColumn("Source", display_text="Open report", validate="^https?://")}
                     st.dataframe(_display, use_container_width=True, hide_index=True, column_config=cfg)
                 except Exception:
+                    # Older Streamlit fallback: retain the source URL as visible text.
                     st.dataframe(_display, use_container_width=True, hide_index=True)
                 st.caption("Fresh 0–30 day reports are shown first; 31–90 day items are fallback context. Target values are extracted from the report headline/summary when stated; verify the original report before relying on a target or rating.")
 
