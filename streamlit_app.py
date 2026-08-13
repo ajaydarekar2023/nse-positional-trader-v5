@@ -3,7 +3,7 @@ import json
 import math
 import re
 import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -24,7 +24,7 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.7"
+APP_VERSION = "V5.2.17"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
@@ -579,6 +579,76 @@ def score_volume(r):
     pts += 5 if breakout and r["VOL_RATIO"] >= 1.5 else 3 if r["VOL_RATIO"] >= 1.2 else 0
     return min(15, pts), breakout
 
+BROKERAGE_FIRM_MAP = {
+    "morgan stanley": "Morgan Stanley",
+    "jefferies": "Jefferies",
+    "clsa": "CLSA",
+    "jp morgan": "JP Morgan",
+    "jpmorgan": "JP Morgan",
+    "hsbc": "HSBC",
+    "goldman sachs": "Goldman Sachs",
+    "nomura": "Nomura",
+    "ubs": "UBS",
+    "citi": "Citi",
+    "macquarie": "Macquarie",
+    "bernstein": "Bernstein",
+    "emkay": "Emkay",
+    "motilal oswal": "Motilal Oswal",
+    "prabhudas lilladher": "Prabhudas Lilladher",
+    "kotak institutional equities": "Kotak Institutional Equities",
+    "axis securities": "Axis Securities",
+    "icici securities": "ICICI Securities",
+    "hdfc securities": "HDFC Securities",
+    "edelweiss": "Edelweiss",
+    "ambit": "Ambit",
+    "incred": "InCred",
+    "yes securities": "YES Securities",
+    "sharekhan": "Sharekhan",
+    "motilal oswal": "Motilal Oswal",
+}
+
+def _brokerage_firm_from_text(text):
+    low = str(text).lower()
+    return next((name for key, name in BROKERAGE_FIRM_MAP.items() if key in low), "")
+
+def _brokerage_action_from_text(text):
+    low = str(text).lower()
+    if re.search(r"\bdowngrad(?:e|ed|es|ing)\b", low):
+        return "Downgrade"
+    if re.search(r"\bupgrad(?:e|ed|es|ing)\b", low):
+        return "Upgrade"
+    if re.search(r"\biniti(?:ate|ated|ates|ating)\b", low):
+        return "Initiated"
+    if any(x in low for x in ("maintain", "reiterate", "retains", "retained", "continues to rate")):
+        return "Maintained"
+    if any(x in low for x in ("buy", "sell", "hold", "neutral", "overweight", "underweight", "outperform", "underperform")):
+        return "Rating"
+    if re.search(r"\btarget(?:\s+price)?\b|\btp\b", low):
+        return "Target"
+    return ""
+
+def _resolve_original_source_url(link, headers):
+    """Resolve a Google News feed redirect to the publisher article when possible.
+
+    If resolution is blocked/unavailable, retain the feed URL rather than failing the
+    brokerage section. The source link is informational only and never affects trading
+    calculations.
+    """
+    link = str(link or "").strip()
+    if not link:
+        return ""
+    try:
+        host = (urlparse(link).netloc or "").lower()
+        if "news.google.com" not in host:
+            return link
+        resp = requests.get(link, headers=headers, timeout=4, allow_redirects=True)
+        final_url = str(getattr(resp, "url", "") or "").strip()
+        if final_url.startswith(("http://", "https://")) and "news.google.com" not in (urlparse(final_url).netloc or "").lower():
+            return final_url
+    except Exception:
+        pass
+    return link
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_brokerage_updates(symbol, limit=10):
     """Information-only brokerage/news layer.
@@ -600,7 +670,7 @@ def fetch_brokerage_updates(symbol, limit=10):
         ("CNBC-TV18", "cnbctv18.com", 2),
         ("Secondary financial sources", "moneycontrol.com;economictimes.indiatimes.com;business-standard.com;financialexpress.com;reuters.com", 3),
     ]
-    cols = ["Date", "Type", "Headline", "Description", "Source", "Priority", "AgeDays", "Link"]
+    cols = ["Date", "Type", "Brokerage", "Action", "Headline", "Description", "Source", "Priority", "AgeDays", "Link"]
     rows, seen = [], set()
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
@@ -635,11 +705,14 @@ def fetch_brokerage_updates(symbol, limit=10):
                 source = "Zee Business"
             elif priority == 2:
                 source = "CNBC-TV18"
-            combined = f"{title} {desc}".lower()
-            keywords = ("broker", "brokerage", "upgrade", "downgrade", "target price",
-                        "target", "buy", "sell", "neutral", "overweight",
-                        "underweight", "rating", "initiated", "reiterate", "maintain")
-            if not any(k in combined for k in keywords):
+            combined = f"{title} {desc}"
+            # A row is considered verified for display only when the article
+            # identifies a known brokerage, has an article URL, and contains a
+            # recognizable brokerage action/rating/target signal. This prevents
+            # generic market-news stories from appearing as brokerage calls.
+            brokerage_firm = _brokerage_firm_from_text(combined)
+            action = _brokerage_action_from_text(combined)
+            if not brokerage_firm or not link or not action:
                 continue
             key = link or title
             if key in seen:
@@ -652,9 +725,14 @@ def fetch_brokerage_updates(symbol, limit=10):
                     age = max(0, int((pd.Timestamp.now(tz="UTC") - dt).total_seconds() // 86400))
                 except Exception:
                     age = None
+            # Date is required for the 30-day priority/fallback rule.
+            if age is None:
+                continue
             rows.append({
                 "Date": pub,
                 "Type": classify(combined),
+                "Brokerage": brokerage_firm,
+                "Action": action,
                 "Headline": title,
                 "Description": desc,
                 "Source": source,
@@ -686,10 +764,15 @@ def fetch_brokerage_updates(symbol, limit=10):
         out["_dt"] = pd.to_datetime(out["Date"], errors="coerce", utc=True)
         now = pd.Timestamp.now(tz="UTC")
         cutoff = now - pd.Timedelta(days=90)
-        out = out[(out["_dt"].isna()) | (out["_dt"] >= cutoff)].copy()
-        out["_fresh"] = out["_dt"].isna() | (out["_dt"] >= now - pd.Timedelta(days=30))
+        out = out[out["_dt"].notna() & (out["_dt"] >= cutoff)].copy()
+        out["_fresh"] = out["_dt"] >= now - pd.Timedelta(days=30)
         out = out.sort_values(["_fresh", "_dt", "Priority"], ascending=[False, False, True], na_position="last")
         out = out.drop(columns=["_dt", "_fresh"]).head(limit)
+        # Preserve the actual publisher article URL whenever the feed supplies a
+        # Google News redirect. If redirect resolution fails, keep the feed URL so
+        # the user still has a working source link instead of a blank cell.
+        if not out.empty:
+            out["Link"] = out["Link"].map(lambda u: _resolve_original_source_url(u, headers))
     except Exception:
         out = out.head(limit)
     return out.reset_index(drop=True), "OK"
@@ -1458,24 +1541,14 @@ elif tab=="🔍 Stock":
                 _b = _broker_df.copy()
                 _b["_text"] = (_b.get("Headline", "").fillna("").astype(str) + " " + _b.get("Description", "").fillna("").astype(str))
 
+                # Verified brokerage/action fields are produced by the fetch layer.
+                # Keep a defensive fallback for older cached rows.
                 def _broker_firm(h):
-                    text = str(h).lower()
-                    firms = {
-                        "morgan stanley":"Morgan Stanley", "jefferies":"Jefferies", "clsa":"CLSA",
-                        "jp morgan":"JP Morgan", "jpmorgan":"JP Morgan", "hsbc":"HSBC",
-                        "goldman sachs":"Goldman Sachs", "nomura":"Nomura", "ubs":"UBS", "citi":"Citi",
-                        "macquarie":"Macquarie", "bernstein":"Bernstein", "emkay":"Emkay",
-                        "motilal oswal":"Motilal Oswal", "prabhudas lilladher":"Prabhudas Lilladher"
-                    }
-                    return next((v for k, v in firms.items() if k in text), "Other / not stated")
+                    firm = _brokerage_firm_from_text(h)
+                    return firm or "Other / not stated"
 
                 def _action(h):
-                    text = str(h).lower()
-                    if "downgrade" in text: return "Downgrade"
-                    if "upgrade" in text: return "Upgrade"
-                    if "initiated" in text or "initiate" in text: return "Initiated"
-                    if any(x in text for x in ("maintain", "reiterate", "retains", "retained")): return "Maintained"
-                    return "Target / Rating"
+                    return _brokerage_action_from_text(h) or "Target / Rating"
 
                 def _target(h):
                     text = re.sub(r'&nbsp;|<[^>]+>', ' ', str(h), flags=re.I)
@@ -1492,19 +1565,32 @@ elif tab=="🔍 Stock":
                             return "₹" + m.group(1)
                     return "—"
 
-                _b["Brokerage"] = _b["_text"].map(_broker_firm)
-                _b["Action"] = _b["_text"].map(_action)
+                if "Brokerage" not in _b.columns:
+                    _b["Brokerage"] = _b["_text"].map(_broker_firm)
+                else:
+                    _b["Brokerage"] = _b["Brokerage"].fillna("").astype(str)
+                    _b.loc[_b["Brokerage"].eq(""), "Brokerage"] = _b.loc[_b["Brokerage"].eq(""), "_text"].map(_broker_firm)
+                if "Action" not in _b.columns:
+                    _b["Action"] = _b["_text"].map(_action)
+                else:
+                    _b["Action"] = _b["Action"].fillna("").astype(str)
+                    _b.loc[_b["Action"].eq(""), "Action"] = _b.loc[_b["Action"].eq(""), "_text"].map(_action)
                 _b["Target"] = _b["_text"].map(_target)
                 _b["Window"] = _b["AgeDays"].apply(lambda x: "Last 30 days" if pd.notna(x) and x <= 30 else "31–90 days")
                 _b["Date"] = pd.to_datetime(_b["Date"], errors="coerce", utc=True).dt.strftime("%d-%b-%Y")
-                # Keep the simple grid. The Source column itself is a real clickable
-                # URL so the original report can always be opened from the table.
-                _display = _b[["Date", "Brokerage", "Action", "Target", "Source", "Window", "Link", "Headline"]].copy()
+                # Keep the simple grid. IMPORTANT: do not retain both the publisher
+                # "Source" field and the article "Link" under the same column name.
+                # That creates duplicate pandas column labels and makes
+                # _display["Source"].str fail with: AttributeError: DataFrame has no
+                # attribute "str". The clickable Source column below is the original
+                # article URL captured from the feed item.
+                _display = _b[["Date", "Brokerage", "Action", "Target", "Link", "Window", "Headline"]].copy()
                 _display = _display.rename(columns={"Headline": "Report / headline", "Link": "Source"})
+                _display = _display.loc[:, ~_display.columns.duplicated()].copy()
                 _display["Source"] = _display["Source"].fillna("").astype(str)
-                _display.loc[~_display["Source"].str.startswith(("http://", "https://")), "Source"] = ""
+                _display.loc[~_display["Source"].str.match(r"^https?://", na=False), "Source"] = ""
                 try:
-                    cfg = {"Source": st.column_config.LinkColumn("Source", display_text="Open report", validate="^https?://")}
+                    cfg = {"Source": st.column_config.LinkColumn("Source", display_text="Open report", validate=r"^https?://")}
                     st.dataframe(_display, use_container_width=True, hide_index=True, column_config=cfg)
                 except Exception:
                     # Older Streamlit fallback: retain the source URL as visible text.
