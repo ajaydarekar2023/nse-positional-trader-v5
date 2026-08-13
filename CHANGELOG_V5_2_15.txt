@@ -1,0 +1,11 @@
+V5.2.15 — In-app Analyze execution + brokerage target/source grid fix
+
+- Fixed shortlist Analyze flow so the selected symbol is seeded into the Stock selectbox widget state before the widget is created.
+- Analyze now automatically runs the existing signal()/stock-analysis path for the selected shortlist symbol after navigation; no new analysis formula or alternate path was introduced.
+- Clears the temporary stock query after successful auto-analysis to prevent repeated analysis loops while retaining the selected stock in the existing widget state.
+- Brokerage table now extracts target prices from both RSS headlines and descriptions/summaries, covering common target/TP wording.
+- Brokerage grid now includes a clickable Source link column using the original report URL.
+- Retains simple grid: Date, Brokerage, Action, Target, Source, Window, Report/headline.
+- Last 30 days remain prioritized; 31–90 days remain fallback context.
+- Brokerage information remains isolated from all scoring, ranking, eligibility, entry, stop, target, Top 20, Top 6 and Top 10 formulas.
+- Python compilation and V5.2.6 regression + Nifty 200 smoke test passed.

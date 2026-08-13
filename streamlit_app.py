@@ -584,25 +584,23 @@ def fetch_brokerage_updates(symbol, limit=10):
     """Information-only brokerage/news layer.
 
     Source priority:
-      1) Zee Business via Google News RSS domain-restricted search
-      2) CNBC-TV18 via Google News RSS domain-restricted search
-      3) Other reputable financial sources via Google News RSS fallback
+      1) Zee Business
+      2) CNBC-TV18
+      3) Other reputable financial sources
+    Recent 0-30 day items are preferred, with 31-90 day items as fallback.
     The function never changes score, ranking, eligibility, entry, stop or target.
-    Failures are isolated so stock analysis continues normally.
     """
     clean = symbol_clean(symbol)
-    # Use both symbol and a human-readable company query where available.
     queries = [
         f'"{clean}" brokerage upgrade downgrade target price',
         f'"{clean}" analyst rating target price',
     ]
-    # Source priority is explicit and reflected in the returned Priority field.
     source_groups = [
         ("Zee Business", "zeebiz.com", 1),
         ("CNBC-TV18", "cnbctv18.com", 2),
         ("Secondary financial sources", "moneycontrol.com;economictimes.indiatimes.com;business-standard.com;financialexpress.com;reuters.com", 3),
     ]
-    cols = ["Date", "Type", "Headline", "Source", "Priority", "AgeDays", "Link"]
+    cols = ["Date", "Type", "Headline", "Description", "Source", "Priority", "AgeDays", "Link"]
     rows, seen = [], set()
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
@@ -612,7 +610,7 @@ def fetch_brokerage_updates(symbol, limit=10):
             return "Upgrade"
         if "downgrade" in low:
             return "Downgrade"
-        if "target price" in low or "target" in low:
+        if any(k in low for k in ("target price", "target raised", "target cut", "target of", "target at", "tp ")):
             return "Target price"
         if any(k in low for k in ("buy", "sell", "neutral", "overweight", "underweight", "rating")):
             return "Rating"
@@ -630,18 +628,18 @@ def fetch_brokerage_updates(symbol, limit=10):
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
             pub = (item.findtext("pubDate") or "").strip()
+            desc = (item.findtext("description") or "").strip()
             source_el = item.find("source")
             source = (source_el.text or "").strip() if source_el is not None else fallback_source
-            # For domain-restricted feeds, normalize the displayed source to the requested publisher.
             if priority == 1:
                 source = "Zee Business"
             elif priority == 2:
                 source = "CNBC-TV18"
-            low = title.lower()
+            combined = f"{title} {desc}".lower()
             keywords = ("broker", "brokerage", "upgrade", "downgrade", "target price",
                         "target", "buy", "sell", "neutral", "overweight",
-                        "underweight", "rating", "initiated")
-            if not any(k in low for k in keywords):
+                        "underweight", "rating", "initiated", "reiterate", "maintain")
+            if not any(k in combined for k in keywords):
                 continue
             key = link or title
             if key in seen:
@@ -656,8 +654,9 @@ def fetch_brokerage_updates(symbol, limit=10):
                     age = None
             rows.append({
                 "Date": pub,
-                "Type": classify(title),
+                "Type": classify(combined),
                 "Headline": title,
+                "Description": desc,
                 "Source": source,
                 "Priority": priority,
                 "AgeDays": age,
@@ -667,21 +666,14 @@ def fetch_brokerage_updates(symbol, limit=10):
         return added
 
     errors = []
-    # Run source groups in strict priority order. We don't stop after one source:
-    # recent items from all available primary sources are useful, while priority
-    # determines ordering when dates are similar.
     for label, domains, priority in source_groups:
-        group_added = 0
         for query in queries:
-            q = f"{query} site:{domains.split(';')[0]}" if ";" not in domains else query
-            if ";" in domains:
-                q = f"{query} ({' OR '.join('site:'+d for d in domains.split(';'))})"
+            q = f"{query} site:{domains.split(';')[0]}" if ";" not in domains else f"{query} ({' OR '.join('site:'+d for d in domains.split(';'))})"
             try:
                 url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
-                group_added += add_feed(url, label, priority)
+                add_feed(url, label, priority)
             except Exception as e:
                 errors.append(f"{label}: {type(e).__name__}")
-        # If primary source is unavailable, continue to the next source by design.
 
     out = pd.DataFrame(rows, columns=cols)
     if out.empty:
@@ -692,18 +684,14 @@ def fetch_brokerage_updates(symbol, limit=10):
 
     try:
         out["_dt"] = pd.to_datetime(out["Date"], errors="coerce", utc=True)
-        # 90-day extended window. Fresh 30-day reports naturally appear first.
-        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
-        recent = out[(out["_dt"].isna()) | (out["_dt"] >= cutoff)].copy()
-        out = recent.sort_values(["_dt", "Priority"], ascending=[False, True], na_position="last")
-        # Prefer 30-day coverage, then older 31-90 day coverage.
-        out["_fresh"] = out["_dt"].isna() | (out["_dt"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30))
+        now = pd.Timestamp.now(tz="UTC")
+        cutoff = now - pd.Timedelta(days=90)
+        out = out[(out["_dt"].isna()) | (out["_dt"] >= cutoff)].copy()
+        out["_fresh"] = out["_dt"].isna() | (out["_dt"] >= now - pd.Timedelta(days=30))
         out = out.sort_values(["_fresh", "_dt", "Priority"], ascending=[False, False, True], na_position="last")
         out = out.drop(columns=["_dt", "_fresh"]).head(limit)
     except Exception:
         out = out.head(limit)
-
-    # Compact source labels for the UI; retain original links.
     return out.reset_index(drop=True), "OK"
 
 def fundamentals(symbol):
@@ -1399,17 +1387,30 @@ elif tab=="🔎 Scanner":
 
 elif tab=="🔍 Stock":
     _u = universe()
-    _default_idx = _u.index(_stock_q) if _stock_deeplink and _stock_q in _u else 0
-    sym=st.selectbox("NSE stock",_u,index=_default_idx)
+    # A shortlist Analyze click supplies _pending_stock before rerun. Seed the
+    # selectbox widget state BEFORE it is created so Streamlit cannot retain the
+    # previously selected stock on mobile. The same mechanism also handles a
+    # direct stock query parameter.
+    _pending = symbol_clean(st.session_state.pop("_pending_stock", ""))
+    _requested = _pending or _stock_q
+    if _requested in _u:
+        st.session_state["stock_selector"] = _requested
+    sym=st.selectbox("NSE stock",_u,key="stock_selector")
     st.caption(f"Eligibility: close ≤ ₹{MAX_STOCK_PRICE:,.0f} and liquid (20D avg traded value ≥ ₹{MIN_AVG_TRADED_VALUE_CR:g}Cr, median ≥ ₹{MIN_MEDIAN_TRADED_VALUE_CR:g}Cr, active volume days ≥ {MIN_ACTIVE_VOLUME_DAYS_PCT:g}%).")
-    _auto_key = f"deep_analyzed_{sym}"
-    _should_auto = _stock_deeplink and _stock_q == symbol_clean(sym) and not st.session_state.get(_auto_key, False)
+    _auto_key = f"deep_analyzed_{symbol_clean(sym)}"
+    _should_auto = bool(_requested and symbol_clean(sym) == _requested and not st.session_state.get(_auto_key, False))
     if st.button("Analyze stock",key="anstock") or _should_auto:
         with st.spinner("Loading stock data…"):
             try:
                 st.session_state["stock_analysis"]=signal(sym)
-                if _should_auto:
-                    st.session_state[_auto_key] = True
+                st.session_state[_auto_key] = True
+                # The query parameter has done its job; keeping the selected widget
+                # state is sufficient and prevents accidental re-analysis loops.
+                if _stock_q:
+                    try:
+                        st.query_params.clear()
+                    except Exception:
+                        pass
             except Exception as e: st.error(str(e))
     if "stock_analysis" in st.session_state:
         r,d,f,ann=st.session_state["stock_analysis"]
@@ -1452,6 +1453,7 @@ elif tab=="🔍 Stock":
                 st.info("No recent brokerage/upgrade/downgrade coverage found for this stock in the available public sources.")
             else:
                 _b = _broker_df.copy()
+                _b["_text"] = (_b.get("Headline", "").fillna("").astype(str) + " " + _b.get("Description", "").fillna("").astype(str))
 
                 def _broker_firm(h):
                     text = str(h).lower()
@@ -1473,20 +1475,32 @@ elif tab=="🔍 Stock":
                     return "Target / Rating"
 
                 def _target(h):
-                    # Handles common headline forms such as "target ₹1,850",
-                    # "target price of Rs 1850", and "TP 1850".
-                    m = re.search(r'(?:target(?:\s+price)?|tp)\s*(?:of|at|to|:)??\s*(?:₹|rs\.?|inr\s*)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)', str(h), re.I)
-                    return ("₹" + m.group(1)) if m else "—"
+                    text = re.sub(r'&nbsp;|<[^>]+>', ' ', str(h), flags=re.I)
+                    text = re.sub(r'\s+', ' ', text)
+                    patterns = [
+                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
+                    ]
+                    for pat in patterns:
+                        m = re.search(pat, text, re.I)
+                        if m:
+                            return "₹" + m.group(1)
+                    return "—"
 
-                _b["Brokerage"] = _b["Headline"].map(_broker_firm)
-                _b["Action"] = _b["Headline"].map(_action)
-                _b["Target"] = _b["Headline"].map(_target)
+                _b["Brokerage"] = _b["_text"].map(_broker_firm)
+                _b["Action"] = _b["_text"].map(_action)
+                _b["Target"] = _b["_text"].map(_target)
                 _b["Window"] = _b["AgeDays"].apply(lambda x: "Last 30 days" if pd.notna(x) and x <= 30 else "31–90 days")
                 _b["Date"] = pd.to_datetime(_b["Date"], errors="coerce", utc=True).dt.strftime("%d-%b-%Y")
-                _display = _b[["Date", "Brokerage", "Action", "Target", "Source", "Window", "Headline"]].copy()
-                _display = _display.rename(columns={"Headline": "Report / headline"})
-                st.dataframe(_display, use_container_width=True, hide_index=True)
-                st.caption("Fresh 0–30 day reports are shown first; 31–90 day items are fallback context. Open the original report before relying on a target or rating.")
+                _display = _b[["Date", "Brokerage", "Action", "Target", "Source", "Window", "Link", "Headline"]].copy()
+                _display = _display.rename(columns={"Headline": "Report / headline", "Link": "Source link"})
+                # Keep the simple grid, but make the source genuinely clickable.
+                try:
+                    cfg = {"Source link": st.column_config.LinkColumn("Source", display_text="Open report", validate="^https?://")}
+                    st.dataframe(_display, use_container_width=True, hide_index=True, column_config=cfg)
+                except Exception:
+                    st.dataframe(_display, use_container_width=True, hide_index=True)
+                st.caption("Fresh 0–30 day reports are shown first; 31–90 day items are fallback context. Target values are extracted from the report headline/summary when stated; verify the original report before relying on a target or rating.")
 
 elif tab=="📊 Backtest":
     sym=st.selectbox("Stock",universe()); initial=st.number_input("Initial capital ₹",100000.,100000000.,1000000.,100000.); rp=st.number_input("Risk/trade %",.1,3.,.75,.05); mp=st.number_input("Max position %",5.,50.,20.,1.); fee=st.number_input("Fees/taxes bps",0.,100.,10.,1.); slip=st.number_input("Slippage bps",0.,100.,5.,1.)
