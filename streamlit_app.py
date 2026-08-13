@@ -372,6 +372,34 @@ def _ha_metrics(df):
     }
 
 
+def _ha_feed_status(ha_time):
+    """Classify freshness of the latest completed 5-minute candle.
+    This is a timestamp-freshness indicator, not a guarantee of exchange real-time access.
+    """
+    try:
+        ts = pd.Timestamp(ha_time)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        else:
+            ts = ts.tz_convert("Asia/Kolkata")
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        age_min = max(0.0, (now - ts).total_seconds() / 60.0)
+
+        # During normal NSE hours, a completed candle <= 7 minutes old is considered
+        # fresh enough for the scanner. Larger gaps are explicitly labelled.
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if not (market_open <= now <= market_close):
+            return "MARKET CLOSED", age_min
+        if age_min <= 7:
+            return "LIVE", age_min
+        if age_min <= 20:
+            return "DELAYED", age_min
+        return "STALE", age_min
+    except Exception:
+        return "STALE", float("nan")
+
+
 def scan_filtered_5m_ha():
     """Scan only the user's 32-stock watchlist and return Top 5 setups."""
     rows, failures = [], []
@@ -388,6 +416,11 @@ def scan_filtered_5m_ha():
         return pd.DataFrame(), failures
     out = pd.DataFrame(rows).sort_values(["HA Score", "Volume X", "Momentum %"], ascending=False).head(HA_TOP_N).reset_index(drop=True)
     out.insert(0, "Rank", np.arange(1, len(out) + 1))
+    # Keep the actual candle timestamp internally so the UI can show freshness
+    # without changing any ranking or trading calculation.
+    freshness = out["HA Time"].map(_ha_feed_status)
+    out["Feed Status"] = freshness.map(lambda x: x[0])
+    out["Age Min"] = freshness.map(lambda x: x[1])
     return out, failures
 
 SECTOR_MAP = {
@@ -1677,6 +1710,7 @@ elif tab=="🚀 5-Min HA":
     st.write("### 🚀 5-Min Heikin-Ashi Momentum")
     st.caption("Scans only your 32 filtered stocks. Requires the latest two COMPLETED 5-minute candles to be green; confirmation factors rank the strongest setups.")
     st.warning("This is a short-term setup scanner, not a guaranteed prediction. Intraday data may be delayed or unavailable; no signal is generated from stale daily data.")
+    st.caption("Freshness is based on the timestamp of the latest completed 5-minute candle. LIVE means recent data (≤7 min old), DELAYED means 8–20 min old, and STALE means >20 min during market hours. This does not guarantee exchange real-time delivery.")
     if st.button("🔄 Scan my 32 now", key="ha32scan", use_container_width=True):
         with st.spinner("Fetching completed 5-minute candles for your 32 stocks…"):
             try:
@@ -1690,7 +1724,7 @@ elif tab=="🚀 5-Min HA":
         if ha_top5.empty:
             st.info("No stocks currently meet the mandatory 2-consecutive-green completed Heikin-Ashi condition.")
         else:
-            display = ha_top5[["Rank","Symbol","Last Price","HA Time","HA Body","Volume X","VWAP","Momentum %","HA Score","Setup"]].copy()
+            display = ha_top5[["Rank","Symbol","Last Price","HA Time","Feed Status","HA Body","Volume X","VWAP","Momentum %","HA Score","Setup"]].copy()
             display["Last Price"] = display["Last Price"].map(lambda x: f"₹{x:,.2f}")
             display["HA Body"] = display["HA Body"].map(lambda x: f"{x:.0%}")
             display["Volume X"] = display["Volume X"].map(lambda x: f"{x:.1f}×" if pd.notna(x) else "—")
@@ -1698,6 +1732,18 @@ elif tab=="🚀 5-Min HA":
             display["Momentum %"] = display["Momentum %"].map(lambda x: f"{x:+.2f}%")
             display["HA Score"] = display["HA Score"].map(lambda x: f"{x:.1f}")
             st.dataframe(display, use_container_width=True, hide_index=True)
+            # Prominent overall feed-status indicator for the freshest qualifying candle.
+            statuses = ha_top5["Feed Status"].value_counts().to_dict()
+            latest_age = float(ha_top5["Age Min"].min()) if "Age Min" in ha_top5.columns and not ha_top5["Age Min"].dropna().empty else float("nan")
+            overall = "LIVE" if statuses.get("LIVE", 0) > 0 else ("DELAYED" if statuses.get("DELAYED", 0) > 0 else ("STALE" if statuses.get("STALE", 0) > 0 else "MARKET CLOSED"))
+            if overall == "LIVE":
+                st.success(f"🟢 LIVE — latest qualifying completed candle is about {latest_age:.0f} min old")
+            elif overall == "DELAYED":
+                st.warning(f"🟡 DELAYED — latest qualifying completed candle is about {latest_age:.0f} min old")
+            elif overall == "STALE":
+                st.error(f"🔴 STALE — latest qualifying completed candle is more than 20 min old")
+            else:
+                st.info("⚪ MARKET CLOSED — no live-market freshness claim")
             st.caption(f"Scanned: {len(FILTERED_STOCKS)} stocks • qualifying Top {len(ha_top5)} • last scan: {ha_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
             if ha_failures:
                 st.caption("Data unavailable/stale for: " + ", ".join(ha_failures[:12]) + (" …" if len(ha_failures) > 12 else ""))
