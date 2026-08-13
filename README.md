@@ -60,3 +60,7 @@ This is a research/paper-trading tool, not an automated trading system. Verify i
 - Upgrade/downgrade/rating/target classification.
 - Source failures never affect trading calculations or break stock analysis.
 - Brokerage information does not modify score, ranking, eligibility, entry, stop, target, Top 20 or Top 6.
+
+
+## V5.2.19 5-Min HA Momentum
+New independent tab: **🚀 5-Min HA**. It scans only the 32-stock filtered watchlist, requires two consecutive completed green Heikin-Ashi candles, and ranks qualifying setups using intraday confirmation metrics. It does not modify positional scoring or trading formulas.

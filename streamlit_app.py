@@ -1,4 +1,5 @@
 import io
+from html import unescape
 import json
 import math
 import re
@@ -13,7 +14,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="NSE Positional Trader V5.2.6", page_icon="📈", layout="centered")
+st.set_page_config(page_title="NSE Positional Trader V5.2.19", page_icon="📈", layout="centered")
 st.markdown("""
 <style>
 .block-container{max-width:1100px;padding:.55rem .65rem 2rem}
@@ -24,7 +25,7 @@ div[data-testid="stMetric"]{padding:.45rem;border-radius:.6rem;border:1px solid 
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "V5.2.17"
+APP_VERSION = "V5.2.19"
 PRIMARY_UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
 SECONDARY_UNIVERSE_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
 NIFTY_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
@@ -265,6 +266,129 @@ FILTERED_STOCKS = [
     "BAJFINANCE", "POLYCAB", "CHOLAFIN", "COFORGE",
 ]
 FILTERED_STOCKS = [nse_symbol(x) for x in FILTERED_STOCKS]
+
+# -----------------------------------------------------------------------------
+# 5-minute Heikin-Ashi momentum scanner (isolated feature; no positional logic)
+# -----------------------------------------------------------------------------
+HA_INTRADAY_PERIOD = "5d"
+HA_INTRADAY_INTERVAL = "5m"
+HA_TOP_N = 5
+
+
+def _completed_5m_ohlcv(symbol):
+    """Fetch recent 5-minute OHLCV and retain completed candles only.
+
+    This scanner is deliberately isolated from the positional scanner. A stale,
+    unavailable, or malformed intraday feed returns an empty frame rather than
+    affecting any existing scan or stock-analysis path.
+    """
+    try:
+        raw = yf.download(symbol, period=HA_INTRADAY_PERIOD, interval=HA_INTRADAY_INTERVAL,
+                          auto_adjust=False, progress=False, threads=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.rename(columns={str(c).title(): str(c).title() for c in raw.columns})
+        needed = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in raw.columns for c in needed):
+            return pd.DataFrame()
+        df = raw[needed].copy().dropna(subset=["Open", "High", "Low", "Close"])
+        if df.empty:
+            return df
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is None:
+            # Yahoo intraday timestamps are normally tz-aware. If a provider
+            # returns naive timestamps, treat them as exchange-local IST.
+            idx = idx.tz_localize("Asia/Kolkata")
+        df.index = idx
+        now = pd.Timestamp.now(tz=idx.tz)
+        # A candle ending after 'now' is still forming and must not be used.
+        candle_end = df.index + pd.Timedelta(minutes=5)
+        df = df[candle_end <= now].copy()
+        # Keep regular NSE hours; this also protects against provider artifacts.
+        local_idx = df.index.tz_convert("Asia/Kolkata")
+        mins = local_idx.hour * 60 + local_idx.minute
+        df = df[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 25)]
+        return df.tail(120)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _ha_metrics(df):
+    """Return the latest two completed HA candles plus confirmation metrics."""
+    if df is None or len(df) < 25:
+        return None
+    x = df.copy()
+    ha_close = (x["Open"] + x["High"] + x["Low"] + x["Close"]) / 4.0
+    ha_open = pd.Series(index=x.index, dtype=float)
+    ha_open.iloc[0] = (x["Open"].iloc[0] + x["Close"].iloc[0]) / 2.0
+    for i in range(1, len(x)):
+        ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0
+    ha_high = pd.concat([x["High"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([x["Low"], ha_open, ha_close], axis=1).min(axis=1)
+    ha = pd.DataFrame({"open":ha_open, "high":ha_high, "low":ha_low, "close":ha_close}, index=x.index)
+    ha["body"] = (ha["close"] - ha["open"]).abs()
+    ha["range"] = (ha["high"] - ha["low"]).replace(0, np.nan)
+    ha["body_pct"] = ha["body"] / ha["range"]
+    ha["green"] = ha["close"] > ha["open"]
+    last2 = ha.iloc[-2:]
+    if not bool(last2["green"].all()):
+        return None
+
+    close = x["Close"]
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    vol_avg = x["Volume"].rolling(20).mean()
+    latest_vol = float(x["Volume"].iloc[-1])
+    vr = latest_vol / float(vol_avg.iloc[-1]) if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1] > 0 else np.nan
+    typical = (x["High"] + x["Low"] + x["Close"]) / 3.0
+    vwap = (typical * x["Volume"]).groupby(x.index.tz_convert("Asia/Kolkata").date).cumsum() / x["Volume"].groupby(x.index.tz_convert("Asia/Kolkata").date).cumsum()
+    latest_vwap = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else np.nan
+    mom3 = float((close.iloc[-1] / close.iloc[-4] - 1) * 100) if len(close) >= 4 and close.iloc[-4] else 0.0
+    body = float(last2["body_pct"].mean())
+    close_near_high = float((x["High"].iloc[-1] - x["Close"].iloc[-1]) / max(x["High"].iloc[-1] - x["Low"].iloc[-1], 1e-9))
+
+    # Confirmation score is separate from every positional score/formula.
+    score = 0.0
+    score += min(25.0, max(0.0, body * 25.0))
+    score += min(20.0, max(0.0, (vr - 0.8) * 20.0 / 1.2)) if pd.notna(vr) else 0.0
+    score += 20.0 if close.iloc[-1] > ema9.iloc[-1] else 0.0
+    score += 20.0 if pd.notna(latest_vwap) and close.iloc[-1] > latest_vwap else 0.0
+    score += min(15.0, max(0.0, mom3 * 3.0))
+    score += min(10.0, max(0.0, (1.0 - close_near_high) * 10.0))
+    score = round(min(100.0, score), 1)
+
+    setup = "🟢 High" if score >= 75 else ("🟢 Moderate" if score >= 60 else "🟡 Watch")
+    return {
+        "Last Price": float(close.iloc[-1]),
+        "HA Body": body,
+        "Volume X": float(vr) if pd.notna(vr) else np.nan,
+        "VWAP": latest_vwap,
+        "Momentum %": mom3,
+        "EMA9": float(ema9.iloc[-1]),
+        "HA Time": last2.index[-1].tz_convert("Asia/Kolkata").strftime("%d-%b %H:%M"),
+        "HA Score": score,
+        "Setup": setup,
+    }
+
+
+def scan_filtered_5m_ha():
+    """Scan only the user's 32-stock watchlist and return Top 5 setups."""
+    rows, failures = [], []
+    for symbol in FILTERED_STOCKS:
+        df = _completed_5m_ohlcv(symbol)
+        if df.empty:
+            failures.append(symbol_clean(symbol))
+            continue
+        m = _ha_metrics(df)
+        if m is None:
+            continue
+        rows.append({"Symbol": symbol_clean(symbol), **m})
+    if not rows:
+        return pd.DataFrame(), failures
+    out = pd.DataFrame(rows).sort_values(["HA Score", "Volume X", "Momentum %"], ascending=False).head(HA_TOP_N).reset_index(drop=True)
+    out.insert(0, "Rank", np.arange(1, len(out) + 1))
+    return out, failures
 
 SECTOR_MAP = {
     "RELIANCE":"Energy","ONGC":"Energy","OIL":"Energy","COALINDIA":"Energy","BPCL":"Energy","IOC":"Energy","GAIL":"Energy","PETRONET":"Energy","ATGL":"Energy","MGL":"Energy","IGL":"Energy","MRPL":"Energy","GUJGASLTD":"Energy",
@@ -627,6 +751,78 @@ def _brokerage_action_from_text(text):
         return "Target"
     return ""
 
+
+def _extract_brokerage_target(text):
+    """Extract a numeric brokerage target from headline/summary/article text.
+
+    This is information-only. It never feeds the trading score, entry, stop,
+    target, eligibility or ranking calculations.
+    """
+    text = unescape(re.sub(r"<[^>]+>", " ", str(text or "")))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    # Prefer the *new/current* target when wording contains a revision such as
+    # "raised target to Rs 12,096" or "target revised to 11,700".
+    patterns = [
+        r"(?:target(?:\s+price)?|price\s+target)\s*(?:was\s+)?(?:raised|hiked|increased|revised|cut|lowered|reduced)?\s*(?:to|at|of|is|:)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        r"(?:raised|hiked|increased|revised|cut|lowered|reduced)\s+(?:the\s+)?target(?:\s+price)?\s*(?:to|at|of|:)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        r"(?:target(?:\s+price)?|price\s+target)\s*(?:was\s+)?(?:raised|hiked|increased|revised|cut|lowered|reduced)?\s*(?:to|at|of|is|:)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        r"(?:target(?:\s+price)?|price\s+target)\s*[-–—:]?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        r"(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:target(?:\s+price)?|price\s+target)",
+        r"\b(?:tp|PT)\s*(?:to|at|of|:)?\s*(?:₹|rs\.?|inr)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\b",
+    ]
+    for pat in patterns:
+        matches = list(re.finditer(pat, text, re.I))
+        if matches:
+            # For revision language, the first match is normally the current
+            # target. Avoid accidentally selecting an old target from the same
+            # sentence when a later current target is explicitly stated.
+            m = matches[0]
+            raw = m.group(1).replace(",", "")
+            try:
+                value = float(raw)
+                if 1 <= value <= 1000000:
+                    return f"₹{value:,.2f}".rstrip("0").rstrip(".")
+            except Exception:
+                pass
+    return ""
+
+def _fetch_article_target(url, headers):
+    """Best-effort target extraction from the linked publisher article.
+
+    Used only when RSS title/summary does not contain a target. Failures are
+    swallowed so a source outage cannot break the brokerage section.
+    """
+    url = str(url or "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    try:
+        resp = requests.get(url, headers=headers, timeout=5, allow_redirects=True)
+        if not getattr(resp, "ok", False):
+            return ""
+        html = str(resp.text or "")[:500000]
+        snippets = []
+        for pat in [
+            r'<title[^>]*>(.*?)</title>',
+            r'<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\'](.*?)["\']',
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+(?:name|property)=["\'](?:description|og:description)["\']',
+        ]:
+            snippets.extend(re.findall(pat, html, re.I | re.S))
+        # Also inspect visible text as a fallback; cap it to avoid excessive
+        # processing on large publisher pages.
+        visible = re.sub(r'<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>', ' ', html, flags=re.I | re.S)
+        visible = re.sub(r'<[^>]+>', ' ', visible)
+        snippets.append(visible[:250000])
+        for snippet in snippets:
+            target = _extract_brokerage_target(unescape(str(snippet)))
+            if target:
+                return target
+    except Exception:
+        return ""
+    return ""
+
 def _resolve_original_source_url(link, headers):
     """Resolve a Google News feed redirect to the publisher article when possible.
 
@@ -670,7 +866,7 @@ def fetch_brokerage_updates(symbol, limit=10):
         ("CNBC-TV18", "cnbctv18.com", 2),
         ("Secondary financial sources", "moneycontrol.com;economictimes.indiatimes.com;business-standard.com;financialexpress.com;reuters.com", 3),
     ]
-    cols = ["Date", "Type", "Brokerage", "Action", "Headline", "Description", "Source", "Priority", "AgeDays", "Link"]
+    cols = ["Date", "Type", "Brokerage", "Action", "Target", "Headline", "Description", "Source", "Priority", "AgeDays", "Link"]
     rows, seen = [], set()
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
@@ -733,6 +929,7 @@ def fetch_brokerage_updates(symbol, limit=10):
                 "Type": classify(combined),
                 "Brokerage": brokerage_firm,
                 "Action": action,
+                "Target": _extract_brokerage_target(combined),
                 "Headline": title,
                 "Description": desc,
                 "Source": source,
@@ -773,6 +970,14 @@ def fetch_brokerage_updates(symbol, limit=10):
         # the user still has a working source link instead of a blank cell.
         if not out.empty:
             out["Link"] = out["Link"].map(lambda u: _resolve_original_source_url(u, headers))
+            # Fill missing targets from the original publisher article only.
+            # RSS summaries frequently omit the numeric target even though the
+            # linked brokerage story contains it (for example, "target Rs 12,096").
+            for idx, row in out.iterrows():
+                if not str(row.get("Target", "") or "").strip():
+                    target = _fetch_article_target(row.get("Link", ""), headers)
+                    if target:
+                        out.at[idx, "Target"] = target
     except Exception:
         out = out.head(limit)
     return out.reset_index(drop=True), "OK"
@@ -1277,7 +1482,7 @@ if st.session_state.pop("_pending_stock_nav", False):
 _default_section = "🔍 Stock" if (_stock_deeplink or _section_q == "stock") else "🏠 Dashboard"
 if "section_nav" not in st.session_state:
     st.session_state["section_nav"] = _default_section
-tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],key="section_nav")
+tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🚀 5-Min HA","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],key="section_nav")
 
 def _open_stock_analysis(symbol, key_prefix):
     s = symbol_clean(symbol)
@@ -1468,6 +1673,35 @@ elif tab=="🔎 Scanner":
                         st.warning(f"{symbol_clean(s)}: {e}")
             if rows: st.dataframe(pd.DataFrame(rows).sort_values("Score",ascending=False),use_container_width=True,hide_index=True)
 
+elif tab=="🚀 5-Min HA":
+    st.write("### 🚀 5-Min Heikin-Ashi Momentum")
+    st.caption("Scans only your 32 filtered stocks. Requires the latest two COMPLETED 5-minute candles to be green; confirmation factors rank the strongest setups.")
+    st.warning("This is a short-term setup scanner, not a guaranteed prediction. Intraday data may be delayed or unavailable; no signal is generated from stale daily data.")
+    if st.button("🔄 Scan my 32 now", key="ha32scan", use_container_width=True):
+        with st.spinner("Fetching completed 5-minute candles for your 32 stocks…"):
+            try:
+                ha_top5, ha_failures = scan_filtered_5m_ha()
+                st.session_state["ha5_scan"] = (ha_top5, ha_failures, datetime.now(timezone.utc))
+            except Exception as e:
+                st.session_state["ha5_scan"] = (pd.DataFrame(), FILTERED_STOCKS, datetime.now(timezone.utc))
+                st.error(f"5-minute scanner unavailable: {type(e).__name__}: {e}")
+    if "ha5_scan" in st.session_state:
+        ha_top5, ha_failures, ha_ts = st.session_state["ha5_scan"]
+        if ha_top5.empty:
+            st.info("No stocks currently meet the mandatory 2-consecutive-green completed Heikin-Ashi condition.")
+        else:
+            display = ha_top5[["Rank","Symbol","Last Price","HA Time","HA Body","Volume X","VWAP","Momentum %","HA Score","Setup"]].copy()
+            display["Last Price"] = display["Last Price"].map(lambda x: f"₹{x:,.2f}")
+            display["HA Body"] = display["HA Body"].map(lambda x: f"{x:.0%}")
+            display["Volume X"] = display["Volume X"].map(lambda x: f"{x:.1f}×" if pd.notna(x) else "—")
+            display["VWAP"] = display["VWAP"].map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+            display["Momentum %"] = display["Momentum %"].map(lambda x: f"{x:+.2f}%")
+            display["HA Score"] = display["HA Score"].map(lambda x: f"{x:.1f}")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.caption(f"Scanned: {len(FILTERED_STOCKS)} stocks • qualifying Top {len(ha_top5)} • last scan: {ha_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
+            if ha_failures:
+                st.caption("Data unavailable/stale for: " + ", ".join(ha_failures[:12]) + (" …" if len(ha_failures) > 12 else ""))
+
 elif tab=="🔍 Stock":
     _u = universe()
     # A shortlist Analyze click supplies _pending_stock before rerun. Seed the
@@ -1551,19 +1785,8 @@ elif tab=="🔍 Stock":
                     return _brokerage_action_from_text(h) or "Target / Rating"
 
                 def _target(h):
-                    text = re.sub(r'&nbsp;|<[^>]+>', ' ', str(h), flags=re.I)
-                    text = re.sub(r'\s+', ' ', text)
-                    # Handle common brokerage-report wording, including cases where
-                    # the currency symbol is omitted (e.g. "CLSA target 1450").
-                    patterns = [
-                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to|raised|cut|revised)?\s*(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
-                        r'(?:target(?:\s+price)?|tp)\s*(?:was|is|at|of|to|raised\s+to|cut\s+to|revised\s+to|raised|cut|revised)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)',
-                    ]
-                    for pat in patterns:
-                        m = re.search(pat, text, re.I)
-                        if m:
-                            return "₹" + m.group(1)
-                    return "—"
+                    target = _extract_brokerage_target(h)
+                    return target or "—"
 
                 if "Brokerage" not in _b.columns:
                     _b["Brokerage"] = _b["_text"].map(_broker_firm)
@@ -1575,7 +1798,12 @@ elif tab=="🔍 Stock":
                 else:
                     _b["Action"] = _b["Action"].fillna("").astype(str)
                     _b.loc[_b["Action"].eq(""), "Action"] = _b.loc[_b["Action"].eq(""), "_text"].map(_action)
-                _b["Target"] = _b["_text"].map(_target)
+                if "Target" not in _b.columns:
+                    _b["Target"] = ""
+                _b["Target"] = _b["Target"].fillna("").astype(str)
+                _missing_target = _b["Target"].str.strip().eq("") | _b["Target"].eq("—")
+                _b.loc[_missing_target, "Target"] = _b.loc[_missing_target, "_text"].map(_target)
+                _b["Target"] = _b["Target"].replace("", "—")
                 _b["Window"] = _b["AgeDays"].apply(lambda x: "Last 30 days" if pd.notna(x) and x <= 30 else "31–90 days")
                 _b["Date"] = pd.to_datetime(_b["Date"], errors="coerce", utc=True).dt.strftime("%d-%b-%Y")
                 # Keep the simple grid. IMPORTANT: do not retain both the publisher
