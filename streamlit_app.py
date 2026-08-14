@@ -423,6 +423,93 @@ def scan_filtered_5m_ha():
     out["Age Min"] = freshness.map(lambda x: x[1])
     return out, failures
 
+
+def _ha_reversal_metrics(df):
+    """Return a potential bullish reversal setup from red -> green -> green HA candles."""
+    if df is None or len(df) < 25:
+        return None
+    x = df.copy()
+    ha_close = (x["Open"] + x["High"] + x["Low"] + x["Close"]) / 4.0
+    ha_open = pd.Series(index=x.index, dtype=float)
+    ha_open.iloc[0] = (x["Open"].iloc[0] + x["Close"].iloc[0]) / 2.0
+    for i in range(1, len(x)):
+        ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2.0
+    ha_high = pd.concat([x["High"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([x["Low"], ha_open, ha_close], axis=1).min(axis=1)
+    ha = pd.DataFrame({"open":ha_open, "high":ha_high, "low":ha_low, "close":ha_close}, index=x.index)
+    ha["body"] = (ha["close"] - ha["open"]).abs()
+    ha["range"] = (ha["high"] - ha["low"]).replace(0, np.nan)
+    ha["body_pct"] = ha["body"] / ha["range"]
+    ha["green"] = ha["close"] > ha["open"]
+
+    last3 = ha.iloc[-3:]
+    # Mandatory pattern: one completed red HA candle followed by two completed green HA candles.
+    if bool(last3["green"].iloc[0]) or not bool(last3["green"].iloc[1]) or not bool(last3["green"].iloc[2]):
+        return None
+    if float(last3["close"].iloc[2]) <= float(last3["close"].iloc[1]):
+        return None
+
+    close = x["Close"]
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    vol_avg = x["Volume"].rolling(20).mean()
+    vr1 = float(x["Volume"].iloc[-2] / vol_avg.iloc[-2]) if pd.notna(vol_avg.iloc[-2]) and vol_avg.iloc[-2] > 0 else np.nan
+    vr2 = float(x["Volume"].iloc[-1] / vol_avg.iloc[-1]) if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1] > 0 else np.nan
+    vr = np.nanmax([vr1, vr2]) if (pd.notna(vr1) or pd.notna(vr2)) else np.nan
+
+    typical = (x["High"] + x["Low"] + x["Close"]) / 3.0
+    dates = x.index.tz_convert("Asia/Kolkata").date
+    vwap = (typical * x["Volume"]).groupby(dates).cumsum() / x["Volume"].groupby(dates).cumsum()
+    latest_vwap = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else np.nan
+
+    # Reversal confirmation: improving momentum, VWAP/EMA reclaim and stronger second green candle.
+    mom3 = float((close.iloc[-1] / close.iloc[-4] - 1) * 100) if len(close) >= 4 and close.iloc[-4] else 0.0
+    second_body = float(last3["body_pct"].iloc[-1])
+    first_green_body = float(last3["body_pct"].iloc[-2])
+    body_strength = min(20.0, max(0.0, ((second_body + first_green_body) / 2.0) * 20.0))
+    volume_score = min(15.0, max(0.0, (vr - 0.8) * 15.0 / 1.2)) if pd.notna(vr) else 0.0
+    vwap_reclaim = 15.0 if pd.notna(latest_vwap) and close.iloc[-1] > latest_vwap else 0.0
+    ema_reclaim = 15.0 if close.iloc[-1] > ema9.iloc[-1] else 0.0
+    momentum_score = min(15.0, max(0.0, mom3 * 3.0))
+    close_strength = 10.0 if (x["High"].iloc[-1] - x["Close"].iloc[-1]) <= 0.25 * max(x["High"].iloc[-1] - x["Low"].iloc[-1], 1e-9) else 0.0
+    pattern_score = 30.0
+
+    score = round(min(100.0, pattern_score + body_strength + volume_score + vwap_reclaim + ema_reclaim + momentum_score + close_strength), 1)
+    setup = "🟢 Strong Reversal" if score >= 80 else ("🟢 Reversal" if score >= 65 else "🟡 Watch")
+
+    return {
+        "Last Price": float(close.iloc[-1]),
+        "Pattern": "🔴🟢🟢",
+        "HA Body": (first_green_body + second_body) / 2.0,
+        "Volume X": float(vr) if pd.notna(vr) else np.nan,
+        "VWAP": latest_vwap,
+        "Momentum %": mom3,
+        "EMA9": float(ema9.iloc[-1]),
+        "HA Time": last3.index[-1].tz_convert("Asia/Kolkata").strftime("%d-%b %H:%M"),
+        "Reversal Score": score,
+        "Setup": setup,
+    }
+
+
+def scan_filtered_5m_reversals():
+    """Scan only the user's 32-stock watchlist for red -> green -> green HA reversals."""
+    rows, failures = [], []
+    for symbol in FILTERED_STOCKS:
+        df = _completed_5m_ohlcv(symbol)
+        if df.empty:
+            failures.append(symbol_clean(symbol))
+            continue
+        m = _ha_reversal_metrics(df)
+        if m is not None:
+            rows.append({"Symbol": symbol_clean(symbol), **m})
+    if not rows:
+        return pd.DataFrame(), failures
+    out = pd.DataFrame(rows).sort_values(["Reversal Score", "Volume X", "Momentum %"], ascending=False).head(5).reset_index(drop=True)
+    out.insert(0, "Rank", np.arange(1, len(out) + 1))
+    freshness = out["HA Time"].map(_ha_feed_status)
+    out["Feed Status"] = freshness.map(lambda x: x[0])
+    out["Age Min"] = freshness.map(lambda x: x[1])
+    return out, failures
+
 SECTOR_MAP = {
     "RELIANCE":"Energy","ONGC":"Energy","OIL":"Energy","COALINDIA":"Energy","BPCL":"Energy","IOC":"Energy","GAIL":"Energy","PETRONET":"Energy","ATGL":"Energy","MGL":"Energy","IGL":"Energy","MRPL":"Energy","GUJGASLTD":"Energy",
     "NTPC":"Utilities","NTPCGREEN":"Utilities","POWERGRID":"Utilities","NHPC":"Utilities","NLCINDIA":"Utilities","SJVN":"Utilities","TATAPOWER":"Utilities","JSWENERGY":"Utilities","TORNTPOWER":"Utilities","CESC":"Utilities",
@@ -1515,7 +1602,7 @@ if st.session_state.pop("_pending_stock_nav", False):
 _default_section = "🔍 Stock" if (_stock_deeplink or _section_q == "stock") else "🏠 Dashboard"
 if "section_nav" not in st.session_state:
     st.session_state["section_nav"] = _default_section
-tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🚀 5-Min HA","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],key="section_nav")
+tab=st.segmented_control("Section",["🏠 Dashboard","🏆 Top 20/Top 6","🔎 Scanner","🚀 5-Min HA","🔄 5-Min Reversal","🔍 Stock","📊 Backtest","💼 Portfolio","📝 Journal","🤖 AI"],key="section_nav")
 
 def _open_stock_analysis(symbol, key_prefix):
     s = symbol_clean(symbol)
@@ -1747,6 +1834,48 @@ elif tab=="🚀 5-Min HA":
             st.caption(f"Scanned: {len(FILTERED_STOCKS)} stocks • qualifying Top {len(ha_top5)} • last scan: {ha_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
             if ha_failures:
                 st.caption("Data unavailable/stale for: " + ", ".join(ha_failures[:12]) + (" …" if len(ha_failures) > 12 else ""))
+
+elif tab=="🔄 5-Min Reversal":
+    st.write("### 🔄 5-Min Bullish Reversal")
+    st.caption("Scans only your 32 filtered stocks for a completed 🔴 red → 🟢 green → 🟢 green Heikin-Ashi pattern with confirmation.")
+    st.warning("A reversal pattern is a setup, not a guaranteed prediction. Use completed 5-minute candles only and confirm price/volume before trading.")
+    st.caption("Scoring: pattern 30 + HA body 20 + volume 15 + VWAP reclaim 15 + EMA9 reclaim 15 + momentum 15 + close strength 10, capped at 100. The score is informational and does not alter positional scoring.")
+    if st.button("🔄 Scan reversal setups", key="harevscan", use_container_width=True):
+        with st.spinner("Checking completed 5-minute candles for your 32 stocks…"):
+            try:
+                rev_top5, rev_failures = scan_filtered_5m_reversals()
+                st.session_state["ha_reversal_scan"] = (rev_top5, rev_failures, datetime.now(timezone.utc))
+            except Exception as e:
+                st.session_state["ha_reversal_scan"] = (pd.DataFrame(), FILTERED_STOCKS, datetime.now(timezone.utc))
+                st.error(f"5-minute reversal scanner unavailable: {type(e).__name__}: {e}")
+    if "ha_reversal_scan" in st.session_state:
+        rev_top5, rev_failures, rev_ts = st.session_state["ha_reversal_scan"]
+        if rev_top5.empty:
+            st.info("No stocks currently meet the mandatory 🔴🟢🟢 completed Heikin-Ashi reversal condition.")
+        else:
+            display = rev_top5[["Rank","Symbol","Last Price","Pattern","HA Time","Feed Status","HA Body","Volume X","VWAP","Momentum %","Reversal Score","Setup"]].copy()
+            display["Last Price"] = display["Last Price"].map(lambda x: f"₹{x:,.2f}")
+            display["HA Body"] = display["HA Body"].map(lambda x: f"{x:.0%}")
+            display["Volume X"] = display["Volume X"].map(lambda x: f"{x:.1f}×" if pd.notna(x) else "—")
+            display["VWAP"] = display["VWAP"].map(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
+            display["Momentum %"] = display["Momentum %"].map(lambda x: f"{x:+.2f}%")
+            display["Reversal Score"] = display["Reversal Score"].map(lambda x: f"{x:.1f}")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            statuses = rev_top5["Feed Status"].value_counts().to_dict()
+            latest_age = float(rev_top5["Age Min"].min()) if "Age Min" in rev_top5.columns and not rev_top5["Age Min"].dropna().empty else float("nan")
+            overall = "LIVE" if statuses.get("LIVE", 0) > 0 else ("DELAYED" if statuses.get("DELAYED", 0) > 0 else ("STALE" if statuses.get("STALE", 0) > 0 else "MARKET CLOSED"))
+            if overall == "LIVE":
+                st.success(f"🟢 LIVE — latest qualifying completed candle is about {latest_age:.0f} min old")
+            elif overall == "DELAYED":
+                st.warning(f"🟡 DELAYED — latest qualifying completed candle is about {latest_age:.0f} min old")
+            elif overall == "STALE":
+                st.error("🔴 STALE — latest qualifying completed candle is more than 20 min old")
+            else:
+                st.info("⚪ MARKET CLOSED — no live-market freshness claim")
+            st.caption(f"Scanned: {len(FILTERED_STOCKS)} stocks • qualifying Top {len(rev_top5)} • last scan: {rev_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
+            if rev_failures:
+                st.caption("Data unavailable for: " + ", ".join(rev_failures[:12]) + (" …" if len(rev_failures) > 12 else ""))
 
 elif tab=="🔍 Stock":
     _u = universe()
